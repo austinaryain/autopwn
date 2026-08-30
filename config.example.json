@@ -1,0 +1,56 @@
+{
+  "llm": {
+    "backend": "ollama",
+    "base_url": "http://localhost:11434",
+    "model": "llama3.1",
+    "api_key_env": "AEGIS_LLM_API_KEY"
+  },
+  "runner": {
+    "use_proxychains": false,
+    "proxychains_bin": "proxychains4",
+    "require_vpn": false,
+    "vpn_interfaces": ["tun0", "wg0"],
+    "default_timeout": 600,
+    "allowed_tools": [
+      "nmap", "masscan", "rustscan",
+      "nikto", "gobuster", "feroxbuster", "dirb", "whatweb", "wpscan",
+      "enum4linux", "enum4linux-ng", "smbclient", "rpcclient", "ldapsearch",
+      "hydra", "medusa", "ncrack",
+      "sqlmap", "ffuf", "wfuzz",
+      "dig", "host", "whois", "theHarvester", "sublist3r", "amass",
+      "curl", "wget", "openssl", "nc", "ping",
+      "searchsploit", "msfconsole", "crackmapexec", "netexec",
+      "john", "hashcat", "hashid",
+      "nuclei", "eyewitness", "cutycapt"
+    ]
+  },
+  "opsec": {
+    "level": "normal"
+  },
+  "msf": {
+    "host": "127.0.0.1",
+    "port": 55553,
+    "user": "msf",
+    "ssl": false
+  },
+  "report": {
+    "include_secrets": false
+  },
+  "dashboard": {
+    "port": 8765
+  },
+  "agent": {
+    "max_steps": 25,
+    "time_budget_minutes": 45,
+    "scan_profile": "normal",
+    "auto_attack_requires_confirmation": true
+  },
+  "paths": {
+    "db": "engagement.db",
+    "logs_dir": "logs",
+    "output_dir": "logs/output",
+    "authorization": "authorization.json",
+    "reports_dir": "reports",
+    "loot_dir": "loot"
+  }
+}

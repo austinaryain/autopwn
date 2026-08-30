@@ -1,0 +1,23 @@
+{
+  "engagement": "example-engagement",
+  "authorized_by": "Jane Client, ACME Corp",
+  "authorization_reference": "Signed Rules of Engagement dated 2026-08-01",
+  "valid_from": "2026-08-01",
+  "valid_until": "2026-09-01",
+  "attestation": "I am explicitly authorized in writing to perform security testing against every host, network and domain listed in this scope.",
+  "scope": [
+    "10.10.10.0/24",
+    "testlab.example.com",
+    "*.acme-test.com"
+  ],
+  "exclusions": [
+    "10.10.10.1"
+  ],
+  "prohibited_techniques": [
+    "denial-of-service",
+    "T1498",
+    "social-engineering"
+  ],
+  "max_requests_per_second": 10,
+  "testing_hours": "09:00-18:00"
+}

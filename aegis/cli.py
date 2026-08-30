@@ -1,0 +1,529 @@
+"""Interactive Aegis shell — chat with the planner or drive agents directly."""
+
+from __future__ import annotations
+
+import json
+import shlex
+from pathlib import Path
+
+from rich.console import Console
+from rich.table import Table
+
+from .agent import Agent
+from .attack_map import coverage, render_coverage
+from .audit import AuditLog
+from .dashboard import DashboardServer
+from .db import EngagementDB
+from .diff import diff_engagements
+from .llm import LLMClient, LLMError
+from .loot import LootVault
+from .msf import MetasploitRPC, MsfError
+from .opsec import OpsecProfile
+from .osint import OSINTCollector, render_osint_summary
+from .parallel import ParallelRunner
+from .postex import PostEx
+from .report import ReportGenerator
+from .runner import Runner, RunnerError
+from .scope import ScopeError, ScopeGate
+from .webvuln import WebVulnPipeline
+
+BANNER = r"""
+   __                  _
+  /  \  ___  ___ _ _  (_)___
+ | ▓▓ |/ _ \/ _ `/ / / (_-<
+ | __ |  __/ (_| | V V / __/
+ |_||_|\___|\__, |\_/|_/___/
+           |___/  Workbench v0.1 — authorized use only
+"""
+
+HELP = """
+Commands:
+  /target add <host> [desc]   add an in-scope target
+  /target list                list targets
+  /osint <host>               pull & display OSINT for a target
+  /scan <host>                start autonomous scan agent
+  /attack <host>              start autonomous attack agent (asks to confirm)
+  /parallel <mode> <h1> <h2>… run one agent per host in parallel
+  /run <tool> [args...]       run one allowlisted tool against scope
+  /findings [host]            show recorded findings
+  /attempts <host>            show attack attempt memory
+  /loot [host]                show the loot vault (creds, hashes, files)
+  /hashes <outfile>           export captured hashes for john/hashcat
+  /map [host]                 MITRE ATT&CK coverage heatmap
+  /webvuln <host>             web pipeline: discover HTTP + nuclei scan
+  /privesc <host>             privesc research (searchsploit vs. memory)
+  /lateral <host>             find & scope-check lateral movement candidates
+  /msf <module> <host>        run a Metasploit exploit via msfrpcd
+  /opsec <normal|stealth|paranoid>  set OPSEC profile
+  /proxy on|off               toggle proxychains wrapping
+  /vpn                        show VPN interface status
+  /dashboard [port]           start live web dashboard (127.0.0.1)
+  /diff <other.db>            diff another engagement DB against this one
+  /report <name>              generate pentest report (MD + HTML)
+  /verify-audit               verify audit-chain integrity
+  /help                       this help
+  /quit                       exit
+Anything else is sent to the planner as chat (ask about attack strategy).
+"""
+
+
+class Shell:
+    def __init__(self, config: dict):
+        self.console = Console()
+        paths = config.get("paths", {})
+        self.db = EngagementDB(paths.get("db", "engagement.db"))
+        self.audit = AuditLog(paths.get("logs_dir", "logs"))
+        self.scope = ScopeGate(paths.get("authorization", "authorization.json"))
+        self.runner = Runner(config, self.db, self.audit, self.scope)
+        self.llm = LLMClient(config)
+        self.agent = Agent(self.llm, self.runner, self.db,
+                           max_steps=config.get("agent", {}).get("max_steps", 25),
+                           time_budget_min=config.get("agent", {})
+                           .get("time_budget_minutes", 45))
+        self.osint = OSINTCollector(self.runner, self.db)
+        # v0.3 hardening: command guard + loot encryption
+        from .crypto import LootCipher
+        from .guard import CommandGuard
+        self.cipher = LootCipher(".")
+        self.db.cipher = self.cipher
+        self.guard = CommandGuard(self.scope, ".")
+        self.runner.guard = self.guard
+        self.loot = LootVault(self.db, self.runner,
+                              paths.get("loot_dir", "loot"))
+        self.webvuln = WebVulnPipeline(self.runner, self.db)
+        self.postex = PostEx(self.runner, self.db, self.scope)
+        self.msf = MetasploitRPC(config)
+        self.parallel = ParallelRunner(self.agent)
+        self.dashboard: DashboardServer | None = None
+        self.opsec = OpsecProfile(config.get("opsec", {}).get("level", "normal"))
+        self.runner.opsec = self.opsec
+        self.config = config
+        self.audit.log("operator", "session", "start",
+                       {"engagement": self.scope.engagement})
+
+    # ---- helpers --------------------------------------------------------
+    def _target_or_print(self, host):
+        row = self.db.get_target(host)
+        if not row:
+            self.console.print(f"[yellow]Unknown target '{host}' — adding it.[/]")
+            tid = self.db.add_target(host)
+            row = self.db.get_target(tid)
+        return row
+
+    def _on_step(self, event: dict) -> None:
+        phase = event.get("phase")
+        if phase == "planned":
+            self.console.print(f"[cyan]step {event['step']}[/] {event['thought']}")
+            self.console.print(f"  [bold]$ {event['command']}[/]")
+        elif phase == "error":
+            self.console.print(f"  [red]error: {event['error']}[/]")
+        else:
+            mark = "✅" if event.get("success") else "❌"
+            self.console.print(f"  {mark} [{event['status']}] {event['evaluation']}")
+
+    # ---- command handlers ------------------------------------------------
+    def cmd_target(self, args):
+        if len(args) >= 2 and args[0] == "add":
+            host = args[1]
+            try:
+                self.scope.check(host)
+            except ScopeError as exc:
+                self.console.print(f"[red]{exc}[/]")
+                return
+            desc = " ".join(args[2:])
+            self.db.add_target(host, desc)
+            self.audit.log("operator", "target", "add", {"host": host, "desc": desc})
+            self.console.print(f"[green]Target added:[/] {host}")
+        else:
+            table = Table(title="Targets")
+            for col in ("id", "host", "status", "description"):
+                table.add_column(col)
+            for t in self.db.list_targets():
+                table.add_row(str(t["id"]), t["host"], t["status"], t["description"])
+            self.console.print(table)
+
+    def cmd_osint(self, args):
+        if not args:
+            return self.console.print("[red]usage: /osint <host>[/]")
+        host = args[0]
+        try:
+            self.scope.check(host)
+        except ScopeError as exc:
+            return self.console.print(f"[red]{exc}[/]")
+        row = self._target_or_print(host)
+        with self.console.status(f"Collecting OSINT for {host}…"):
+            data = self.osint.collect(row["host"], row["id"])
+        self.console.print(render_osint_summary(data))
+
+    def cmd_agent(self, mode, args):
+        if not args:
+            return self.console.print(f"[red]usage: /{mode} <host>[/]")
+        host = args[0]
+        try:
+            self.scope.check(host)
+        except ScopeError as exc:
+            return self.console.print(f"[red]{exc}[/]")
+        if mode == "attack" and self.config.get("agent", {}).get(
+                "auto_attack_requires_confirmation", True):
+            ans = input(f"Launch autonomous ATTACK agent on {host}? "
+                        "Confirm you are authorized [yes/NO]: ")
+            if ans.strip().lower() != "yes":
+                return self.console.print("[yellow]Aborted by operator.[/]")
+        if not self.llm.available():
+            return self.console.print("[red]LLM backend unavailable — start Ollama "
+                                      "or check config.json.[/]")
+        self.console.print(f"[bold magenta]Starting {mode} agent on {host}[/]")
+        result = self.agent.run(mode, host, on_step=self._on_step)
+        n = len(result["transcript"])
+        self.console.print(f"[green]{mode} agent finished after {n} steps.[/]")
+
+    def cmd_run(self, args):
+        if not args:
+            return self.console.print("[red]usage: /run <tool> [args...][/]")
+        tool, targs = args[0], args[1:]
+        host = next((a for a in targs if not a.startswith("-")), None)
+        try:
+            result = self.runner.run(tool, targs, target_host=host, agent="operator")
+            self.console.print(f"[bold]{result.status}[/] exit={result.exit_code} "
+                               f"({result.duration:.1f}s) → {result.output_file}")
+            if result.stdout_tail:
+                from rich.markup import escape
+                self.console.print(escape(result.stdout_tail))
+        except RunnerError as exc:
+            self.console.print(f"[red]{exc}[/]")
+
+    def cmd_findings(self, args):
+        row = self.db.get_target(args[0]) if args else None
+        findings = self.db.findings_for(row["id"]) if row else self.db.findings_for()
+        table = Table(title="Findings")
+        for col in ("id", "severity", "title", "status"):
+            table.add_column(col)
+        for f in findings:
+            table.add_row(str(f["id"]), f["severity"], f["title"], f["status"])
+        self.console.print(table)
+
+    def cmd_attempts(self, args):
+        if not args:
+            return self.console.print("[red]usage: /attempts <host>[/]")
+        row = self.db.get_target(args[0])
+        if not row:
+            return self.console.print("[red]unknown target[/]")
+        table = Table(title=f"Attempt memory — {row['host']}")
+        for col in ("ok", "technique", "vector", "result"):
+            table.add_column(col)
+        for a in self.db.attempts_for(row["id"]):
+            table.add_row("✅" if a["success"] else "❌", a["technique"],
+                          a["vector"], (a["result"] or "")[:80])
+        self.console.print(table)
+
+    def cmd_report(self, args):
+        name = args[0] if args else self.scope.engagement
+        include_secrets = bool(self.config.get("report", {})
+                               .get("include_secrets", False))
+        gen = ReportGenerator(self.db, name, self.config.get("paths", {})
+                              .get("reports_dir", "reports"),
+                              include_secrets=include_secrets)
+        md = gen.build_markdown()
+        html = gen.build_html(md)
+        self.audit.log("operator", "report", "generated",
+                       {"md": str(md), "html": str(html),
+                        "include_secrets": include_secrets})
+        note = "" if include_secrets else " (secrets redacted)"
+        self.console.print(f"[green]Report written{note}:[/]\n  {md}\n  {html}")
+
+    def cmd_verify_audit(self):
+        for p in sorted(Path(self.config.get("paths", {}).get("logs_dir", "logs"))
+                        .glob("audit-*.jsonl")):
+            ok, msg = AuditLog.verify(p)
+            color = "green" if ok else "red"
+            self.console.print(f"[{color}]{p.name}: {msg}[/]")
+
+    # ---- v0.2 handlers ---------------------------------------------------
+    def _scoped_target(self, host: str):
+        """Scope-check + resolve target row, printing errors. None on failure."""
+        try:
+            self.scope.check(host)
+        except ScopeError as exc:
+            self.console.print(f"[red]{exc}[/]")
+            return None
+        return self._target_or_print(host)
+
+    def cmd_loot(self, args):
+        row = self.db.get_target(args[0]) if args else None
+        items = self.db.loot_for(row["id"]) if row else self.db.loot_for()
+        table = Table(title="Loot vault")
+        for col in ("id", "kind", "title", "value / file", "source"):
+            table.add_column(col)
+        for l in items:
+            table.add_row(str(l["id"]), l["kind"], l["title"],
+                          (l["value"] or l["file_path"])[:70], l["source"][:40])
+        self.console.print(table)
+
+    def cmd_hashes(self, args):
+        if not args:
+            return self.console.print("[red]usage: /hashes <outfile>[/]")
+        out = self.loot.export_hashes(args[0])
+        n = len(out.read_text(encoding="utf-8").split())
+        self.console.print(f"[green]{n} hashes exported → {out}[/] "
+                           f"(feed to john or hashcat)")
+
+    def cmd_map(self, args):
+        row = self.db.get_target(args[0]) if args else None
+        cov = coverage(self.db, row["id"] if row else None)
+        self.console.print("```\n" + render_coverage(cov) + "\n```")
+
+    def cmd_webvuln(self, args):
+        if not args:
+            return self.console.print("[red]usage: /webvuln <host>[/]")
+        row = self._scoped_target(args[0])
+        if not row:
+            return
+        with self.console.status(f"Web pipeline on {row['host']}…"):
+            result = self.webvuln.run(row["host"], row["id"])
+        self.console.print(f"Web services: {result['web_services'] or 'none found'}")
+        self.console.print(f"[green]{result['findings']} nuclei findings recorded.[/]")
+        for e in result["errors"]:
+            self.console.print(f"[yellow]{e}[/]")
+
+    def cmd_privesc(self, args):
+        if not args:
+            return self.console.print("[red]usage: /privesc <host>[/]")
+        row = self._scoped_target(args[0])
+        if not row:
+            return
+        with self.console.status("Researching privesc paths…"):
+            results = self.postex.privesc_check(row["id"], row["host"])
+        if not results:
+            return self.console.print("[yellow]No version candidates in memory — "
+                                      "run /scan first.[/]")
+        for r in results:
+            self.console.print(f"[bold]{r['query']}[/]")
+            for h in r["hits"]:
+                self.console.print(f"  {h}")
+
+    def cmd_lateral(self, args):
+        if not args:
+            return self.console.print("[red]usage: /lateral <host>[/]")
+        row = self._scoped_target(args[0])
+        if not row:
+            return
+        found = self.postex.lateral_candidates(row["id"])
+        self.console.print(f"[green]Queued (in scope):[/] {found['queued'] or 'none'}")
+        self.console.print(f"[red]Out of scope (refused):[/] "
+                           f"{found['out_of_scope'] or 'none'}")
+        creds = self.postex.credentials_for_lateral()
+        if creds:
+            self.console.print("[bold]Looted credentials usable for lateral "
+                               "movement:[/]")
+            for c in creds:
+                self.console.print(f"  🔑 {c['title']}: {c['value']}")
+
+    def cmd_msf(self, args):
+        if len(args) < 2:
+            return self.console.print("[red]usage: /msf <exploit-module> <host> "
+                                      "[payload][/]")
+        module, host = args[0], args[1]
+        payload = args[2] if len(args) > 2 else ""
+        row = self._scoped_target(host)
+        if not row:
+            return
+        if not self.msf.available():
+            return self.console.print("[red]msfrpcd not reachable — start it with: "
+                                      "msfrpcd -P <pass> -S -a 127.0.0.1[/]")
+        ans = input(f"Execute {module} against {host}? Confirm authorization "
+                    "[yes/NO]: ")
+        if ans.strip().lower() != "yes":
+            return self.console.print("[yellow]Aborted.[/]")
+        try:
+            resp = self.msf.run_exploit(module, host, payload)
+            self.console.print(f"[green]msf job:[/] {resp}")
+            self.db.record_attempt(row["id"], "msf-exploit", module, module,
+                                   str(resp)[:300], "job_id" in resp,
+                                   attack_id="T1059")
+            self.audit.log("operator", "msf", "exploit",
+                           {"module": module, "host": host, "resp": str(resp)[:500]})
+        except MsfError as exc:
+            self.console.print(f"[red]{exc}[/]")
+
+    def cmd_opsec(self, args):
+        if args:
+            self.opsec = OpsecProfile(args[0])
+            self.runner.opsec = self.opsec
+            self.audit.log("operator", "opsec", "level", {"level": self.opsec.level})
+        enforce = "proxychains enforced" if self.opsec.enforce_proxy else "proxy optional"
+        self.console.print(f"OPSEC level: [bold]{self.opsec.level}[/] ({enforce})")
+
+    def cmd_parallel(self, args):
+        if len(args) < 2:
+            return self.console.print("[red]usage: /parallel <scan|attack> "
+                                      "<host1> <host2> …[/]")
+        mode, hosts = args[0], args[1:]
+        if mode not in ("scan", "attack"):
+            return self.console.print("[red]mode must be scan or attack[/]")
+        jobs = []
+        for h in hosts:
+            try:
+                self.scope.check(h)
+                jobs.append((mode, h))
+            except ScopeError as exc:
+                self.console.print(f"[red]{exc}[/]")
+        if not jobs:
+            return
+        if mode == "attack":
+            ans = input(f"Launch ATTACK agents on {len(jobs)} hosts? [yes/NO]: ")
+            if ans.strip().lower() != "yes":
+                return self.console.print("[yellow]Aborted.[/]")
+        if not self.llm.available():
+            return self.console.print("[red]LLM backend unavailable.[/]")
+
+        def on_step(host, event):
+            phase = event.get("phase")
+            if phase == "planned":
+                self.console.print(f"[cyan][{host}] step {event['step']}:[/] "
+                                   f"$ {event['command']}")
+            elif phase == "observed":
+                mark = "✅" if event.get("success") else "❌"
+                self.console.print(f"[{host}] {mark} {event['evaluation']}")
+            elif phase == "error":
+                self.console.print(f"[{host}] [red]{event['error']}[/]")
+
+        self.console.print(f"[bold magenta]Launching {len(jobs)} {mode} agents…[/]")
+        results = self.parallel.run(jobs, on_step=on_step)
+        for host, res in results.items():
+            if isinstance(res, dict):
+                self.console.print(f"[green]{host}: {len(res['transcript'])} steps[/]")
+            else:
+                self.console.print(f"[red]{host}: {res}[/]")
+
+    def cmd_dashboard(self, args):
+        port = int(args[0]) if args else int(
+            self.config.get("dashboard", {}).get("port", 8765))
+        if self.dashboard:
+            self.console.print(f"[yellow]Already running:[/] "
+                               f"http://127.0.0.1:{self.dashboard.port}/")
+            return
+        self.dashboard = DashboardServer(self.db, port=port)
+        url = self.dashboard.start()
+        self.audit.log("operator", "dashboard", "start", {"url": url})
+        self.console.print(f"[green]Dashboard live at {url}[/] (auto-refreshes; "
+                           f"Ctrl-C safe, runs in background thread)")
+
+    def cmd_diff(self, args):
+        if not args:
+            return self.console.print("[red]usage: /diff <other-engagement.db>[/]")
+        if not Path(args[0]).exists():
+            return self.console.print(f"[red]no such file: {args[0]}[/]")
+        report = diff_engagements(args[0], self.db)
+        self.console.print(report)
+
+    # ---- main loop -------------------------------------------------------
+    def run(self):
+        self.console.print(BANNER, style="bold blue")
+        self.console.print(f"Engagement: [bold]{self.scope.engagement}[/]  "
+                           f"scope={len(self.scope.scope)} entries  "
+                           f"proxychains={'on' if self.runner.use_proxychains else 'off'}")
+        roe = self.scope.roe
+        roe_bits = []
+        if roe.get("prohibited_techniques"):
+            roe_bits.append(f"prohibited: {', '.join(roe['prohibited_techniques'])}")
+        if roe.get("max_requests_per_second"):
+            roe_bits.append(f"max {roe['max_requests_per_second']} req/s")
+        if roe.get("testing_hours"):
+            roe_bits.append(f"hours {roe['testing_hours']}")
+        if roe_bits:
+            self.console.print(f"[yellow]RoE:[/] {' · '.join(roe_bits)}")
+        if self.cipher.active:
+            self.console.print("[green]Loot encryption: ON[/] (Fernet, at rest)")
+        else:
+            self.console.print(f"[red]Loot encryption: OFF — {self.cipher.error}[/]")
+        self.console.print("Type /help for commands, or just chat.\n")
+        while True:
+            try:
+                line = input("aegis> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not line:
+                continue
+            if not line.startswith("/"):
+                self._chat(line)
+                continue
+            try:
+                parts = shlex.split(line[1:])
+            except ValueError:
+                continue
+            if not parts:
+                continue
+            cmd, args = parts[0].lower(), parts[1:]
+            try:
+                if cmd in ("quit", "exit", "q"):
+                    break
+                elif cmd == "help":
+                    self.console.print(HELP)
+                elif cmd == "target":
+                    self.cmd_target(args)
+                elif cmd == "osint":
+                    self.cmd_osint(args)
+                elif cmd in ("scan", "attack"):
+                    self.cmd_agent(cmd, args)
+                elif cmd == "run":
+                    self.cmd_run(args)
+                elif cmd == "findings":
+                    self.cmd_findings(args)
+                elif cmd == "attempts":
+                    self.cmd_attempts(args)
+                elif cmd == "loot":
+                    self.cmd_loot(args)
+                elif cmd == "hashes":
+                    self.cmd_hashes(args)
+                elif cmd == "map":
+                    self.cmd_map(args)
+                elif cmd == "webvuln":
+                    self.cmd_webvuln(args)
+                elif cmd == "privesc":
+                    self.cmd_privesc(args)
+                elif cmd == "lateral":
+                    self.cmd_lateral(args)
+                elif cmd == "msf":
+                    self.cmd_msf(args)
+                elif cmd == "opsec":
+                    self.cmd_opsec(args)
+                elif cmd == "parallel":
+                    self.cmd_parallel(args)
+                elif cmd == "dashboard":
+                    self.cmd_dashboard(args)
+                elif cmd == "diff":
+                    self.cmd_diff(args)
+                elif cmd == "proxy":
+                    self.runner.use_proxychains = (args[:1] == ["on"])
+                    self.console.print(f"proxychains: "
+                                       f"{'ON' if self.runner.use_proxychains else 'OFF'}")
+                elif cmd == "vpn":
+                    up = self.runner.vpn_up()
+                    self.console.print(f"VPN interface up: {'yes' if up else 'no'}")
+                elif cmd == "report":
+                    self.cmd_report(args)
+                elif cmd == "verify-audit":
+                    self.cmd_verify_audit()
+                else:
+                    self.console.print(f"[red]unknown command /{cmd} — try /help[/]")
+            except ScopeError as exc:
+                self.console.print(f"[red]SCOPE: {exc}[/]")
+            except Exception as exc:  # keep the shell alive
+                self.console.print(f"[red]error: {exc}[/]")
+        if self.dashboard:
+            self.dashboard.stop()
+        self.audit.log("operator", "session", "end", {})
+        self.db.close()
+        self.console.print("[blue]Session closed. Audit chain intact.[/]")
+
+    def _chat(self, text: str):
+        targets = self.db.list_targets()
+        target = targets[-1]["host"] if targets else "(no target selected)"
+        self.audit.log("operator", "chat", "question", {"text": text})
+        try:
+            with self.console.status("Thinking…"):
+                answer = self.agent.advise(target, text)
+            self.console.print(answer)
+            self.audit.log("planner", "chat", "answer", {"text": answer[:2000]})
+        except LLMError as exc:
+            self.console.print(f"[red]{exc}[/]")

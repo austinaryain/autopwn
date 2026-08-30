@@ -1,0 +1,6 @@
+rich>=13.0
+requests>=2.31
+prompt_toolkit>=3.0
+msgpack>=1.0
+cryptography>=41.0
+pytest>=8.0
