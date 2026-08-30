@@ -44,6 +44,9 @@ Commands:
   /scan <host>                start autonomous scan agent
   /attack <host>              start autonomous attack agent (asks to confirm)
   /parallel <mode> <h1> <h2>… run one agent per host in parallel
+  /mission <host> [--no-exploit]  full operator chain: recon → exploiter → analyst
+  /refute <host>              adversarial re-verification of LLM-claimed findings
+  /disclose <finding-id>      draft a HackerOne-style disclosure (you send it)
   /run <tool> [args...]       run one allowlisted tool against scope
   /findings [host]            show recorded findings
   /attempts <host>            show attack attempt memory
@@ -59,6 +62,8 @@ Commands:
   /vpn                        show VPN interface status
   /dashboard [port]           start live web dashboard (127.0.0.1)
   /diff <other.db>            diff another engagement DB against this one
+  /doctor                     environment health check (tools, LLM, crypto…)
+  /logs [n]                   show last n warnings/errors from the debug log
   /report <name>              generate pentest report (MD + HTML)
   /verify-audit               verify audit-chain integrity
   /help                       this help
@@ -71,6 +76,9 @@ class Shell:
     def __init__(self, config: dict):
         self.console = Console()
         paths = config.get("paths", {})
+        from .diag import get_logger, setup_logging
+        self.debug_log = setup_logging(paths.get("logs_dir", "logs"))
+        self.log = get_logger("cli")
         self.db = EngagementDB(paths.get("db", "engagement.db"))
         self.audit = AuditLog(paths.get("logs_dir", "logs"))
         self.scope = ScopeGate(paths.get("authorization", "authorization.json"))
@@ -94,6 +102,13 @@ class Shell:
         self.postex = PostEx(self.runner, self.db, self.scope)
         self.msf = MetasploitRPC(config)
         self.parallel = ParallelRunner(self.agent)
+        from .disclosure import DisclosurePipeline
+        from .operators import Coordinator
+        from .provenance import Refuter
+        self.refuter = Refuter(self.llm, self.db)
+        self.coordinator = Coordinator(self.agent, self.db, self.refuter)
+        self.disclosure = DisclosurePipeline(
+            self.db, paths.get("disclosures_dir", "disclosures"))
         self.dashboard: DashboardServer | None = None
         self.opsec = OpsecProfile(config.get("opsec", {}).get("level", "normal"))
         self.runner.opsec = self.opsec
@@ -403,10 +418,89 @@ class Shell:
                                f"http://127.0.0.1:{self.dashboard.port}/")
             return
         self.dashboard = DashboardServer(self.db, port=port)
+        self.dashboard.mission_handler = self._mission_handler
         url = self.dashboard.start()
         self.audit.log("operator", "dashboard", "start", {"url": url})
-        self.console.print(f"[green]Dashboard live at {url}[/] (auto-refreshes; "
-                           f"Ctrl-C safe, runs in background thread)")
+        self.console.print(f"[green]War Room live at {url}[/] (auto-refreshes; "
+                           f"mission control enabled)")
+
+    def _mission_handler(self, host: str, mode: str) -> None:
+        """War Room mission launch (HTTP API entry). Scope is enforced here."""
+        self.scope.check(host)  # raises → mission status = error
+        self.audit.log("war-room", "mission", "start", {"host": host, "mode": mode})
+        if mode == "mission":
+            self.coordinator.run_mission(host)
+        else:
+            self.agent.run(mode, host)
+
+    def cmd_mission(self, args):
+        if not args:
+            return self.console.print("[red]usage: /mission <host> [--no-exploit][/]")
+        host = args[0]
+        skip_exploit = "--no-exploit" in args
+        try:
+            self.scope.check(host)
+        except ScopeError as exc:
+            return self.console.print(f"[red]{exc}[/]")
+        self._target_or_print(host)
+        if not self.llm.available():
+            return self.console.print("[red]LLM backend unavailable.[/]")
+        if not skip_exploit:
+            ans = input(f"Full mission on {host} includes the EXPLOITER phase. "
+                        "Confirm written authorization [yes/NO]: ")
+            if ans.strip().lower() != "yes":
+                skip_exploit = True
+                self.console.print("[yellow]Running recon+analyst only.[/]")
+        self.console.print(f"[bold magenta]Mission launch:[/] {host} "
+                           f"(recon → {'exploiter → ' if not skip_exploit else ''}analyst)")
+        result = self.coordinator.run_mission(
+            host, skip_exploit=skip_exploit,
+            on_step=lambda e: self._on_step(e))
+        refutations = result["phases"].get("analyst", {}).get("refutations", [])
+        for r in refutations:
+            icon = {"confirmed": "✅", "uncertain": "❓", "rejected": "🚫"}.get(
+                r["verdict"], "❓")
+            self.console.print(f"  {icon} refuter: {r['title']} — {r['verdict']} "
+                               f"({r['reason'][:80]})")
+        self.console.print("[green]Mission complete. /report to render.[/]")
+
+    def cmd_refute(self, args):
+        row = None
+        if args:
+            row = self.db.get_target(args[0])
+        if not row:
+            return self.console.print("[red]usage: /refute <host>[/]")
+        if not self.llm.available():
+            return self.console.print("[red]LLM backend unavailable.[/]")
+        with self.console.status("Refuter reviewing model-asserted findings…"):
+            results = self.refuter.review_target(row["id"])
+        if not results:
+            return self.console.print("[yellow]Nothing to review — no "
+                                      "model-asserted medium+ findings.[/]")
+        for r in results:
+            icon = {"confirmed": "✅", "uncertain": "❓", "rejected": "🚫"}.get(
+                r["verdict"], "❓")
+            self.console.print(f"{icon} [{r['finding_id']}] {r['title']}: "
+                               f"{r['verdict']} — {r['reason']}")
+
+    def cmd_disclose(self, args):
+        if not args or not args[0].isdigit():
+            return self.console.print("[red]usage: /disclose <finding-id>[/]")
+        fid = int(args[0])
+        f = self.db.get_finding(fid)
+        if not f:
+            return self.console.print(f"[red]no finding #{fid}[/]")
+        if not f["verified"]:
+            ans = input(f"Finding #{fid} is UNVERIFIED ({f['provenance']}). "
+                        "Draft anyway? [yes/NO]: ")
+            if ans.strip().lower() != "yes":
+                return
+        out = self.disclosure.draft(fid)
+        self.audit.log("operator", "disclosure", "draft",
+                       {"finding_id": fid, "file": str(out)})
+        self.console.print(f"[green]Disclosure draft:[/] {out}\n"
+                           f"[yellow]Review, validate, and submit manually — "
+                           f"Aegis never sends.[/]")
 
     def cmd_diff(self, args):
         if not args:
@@ -415,6 +509,29 @@ class Shell:
             return self.console.print(f"[red]no such file: {args[0]}[/]")
         report = diff_engagements(args[0], self.db)
         self.console.print(report)
+
+    def cmd_doctor(self):
+        from .diag import doctor
+        with self.console.status("Running health checks…"):
+            results = doctor(self.config, self)
+        table = Table(title="Aegis doctor")
+        for col in ("check", "status", "detail"):
+            table.add_column(col)
+        for r in results:
+            table.add_row(r["name"],
+                          "[green]OK[/]" if r["ok"] else "[red]FAIL[/]",
+                          r["detail"])
+        self.console.print(table)
+        fails = sum(1 for r in results if not r["ok"])
+        self.console.print(f"[{'green' if fails == 0 else 'yellow'}]"
+                           f"{len(results) - fails}/{len(results)} checks healthy[/]")
+
+    def cmd_logs(self, args):
+        from .diag import tail_debug_log
+        lines = int(args[0]) if args and args[0].isdigit() else 40
+        for line in tail_debug_log(self.config.get("paths", {})
+                                   .get("logs_dir", "logs"), lines):
+            self.console.print(f"[dim]{line}[/]")
 
     # ---- main loop -------------------------------------------------------
     def run(self):
@@ -493,6 +610,16 @@ class Shell:
                     self.cmd_dashboard(args)
                 elif cmd == "diff":
                     self.cmd_diff(args)
+                elif cmd == "doctor":
+                    self.cmd_doctor()
+                elif cmd == "logs":
+                    self.cmd_logs(args)
+                elif cmd == "mission":
+                    self.cmd_mission(args)
+                elif cmd == "refute":
+                    self.cmd_refute(args)
+                elif cmd == "disclose":
+                    self.cmd_disclose(args)
                 elif cmd == "proxy":
                     self.runner.use_proxychains = (args[:1] == ["on"])
                     self.console.print(f"proxychains: "
@@ -509,7 +636,9 @@ class Shell:
             except ScopeError as exc:
                 self.console.print(f"[red]SCOPE: {exc}[/]")
             except Exception as exc:  # keep the shell alive
-                self.console.print(f"[red]error: {exc}[/]")
+                self.log.exception("command /%s failed", cmd)
+                self.console.print(f"[red]error: {exc}[/] "
+                                   f"[dim](traceback in {self.debug_log})[/]")
         if self.dashboard:
             self.dashboard.stop()
         self.audit.log("operator", "session", "end", {})

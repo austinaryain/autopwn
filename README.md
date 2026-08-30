@@ -76,6 +76,27 @@ aegis> /attack 10.10.10.5          # autonomous attack agent (adapts from memory
 aegis> /report engagement          # writes report-engagement.md + .html
 ```
 
+## Diagnostics & troubleshooting
+
+Two logging layers, two different questions:
+
+- **Audit chain** (`logs/audit-*.jsonl`) — *what did Aegis do?* Tamper-evident, for clients and legal defensibility. Verify with `/verify-audit`.
+- **Debug log** (`logs/debug-*.log`) — *why did it misbehave?* Verbose per-module logging (planner decisions, LLM errors, guard refusals with full args, exec timings, timeouts). Tail it with `/logs [n]`; exceptions from any command land here with full tracebacks.
+
+`/doctor` runs a 12-point environment health check: Python, deps, authorization, loot encryption, LLM reachability, proxychains, VPN interfaces, Kali tool inventory, OSV API.
+
+First run on Kali: `bash setup_kali.sh` — checks/installs everything, pulls the Ollama model, walks you through scoping `authorization.json`, and gates on the full test suite + simulation validation before declaring readiness.
+
+## v0.4 — trust & kill-chain maturity (T3MP3ST gap-closure)
+
+| Feature | Detail |
+|---|---|
+| **Finding provenance** | Every finding labeled `tool-proven` (deterministic parser) or `model-asserted` (LLM claim). Only verified findings ship in the report's main section; the rest go to an "Unverified Candidates" appendix. |
+| **Refuter pass** | `/refute <host>` — an adversarial reviewer prompt tries to *disprove* every model-asserted medium+ finding from the captured evidence. Outcomes: confirmed / needs-verification / rejected (rejected findings are excluded from reports). |
+| **Operator chain** | `/mission <host>` runs Recon → Exploiter → Analyst via a [Coordinator](aegis/operators.py) sharing engagement memory; the Analyst refutes findings and writes the report's **Attack Narrative** section. |
+| **War Room** | Dashboard is now interactive: mission launch form + `POST /api/mission/start` / mission status in `/api/state`, all behind the session token. |
+| **Disclosure pipeline** | `/disclose <finding-id>` — OSV novelty check + HackerOne/Bugcrowd-style markdown draft in `disclosures/`. Aegis never sends anything; a human reviews and submits. Unverified findings require explicit confirmation before drafting. |
+
 ## Lab validation — prove it before client use
 
 The full **scan → attack → report** loop ships as an executable checklist:

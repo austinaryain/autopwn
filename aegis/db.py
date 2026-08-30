@@ -89,6 +89,9 @@ MIGRATIONS = [
     ("findings", "remediation", "ALTER TABLE findings ADD COLUMN remediation TEXT DEFAULT ''"),
     ("findings", "attack_id", "ALTER TABLE findings ADD COLUMN attack_id TEXT DEFAULT ''"),
     ("attempts", "attack_id", "ALTER TABLE attempts ADD COLUMN attack_id TEXT DEFAULT ''"),
+    ("findings", "provenance", "ALTER TABLE findings ADD COLUMN provenance TEXT DEFAULT 'model-asserted'"),
+    ("findings", "verified", "ALTER TABLE findings ADD COLUMN verified INTEGER DEFAULT 0"),
+    ("findings", "refuter_note", "ALTER TABLE findings ADD COLUMN refuter_note TEXT DEFAULT ''"),
 ]
 
 
@@ -188,16 +191,31 @@ class EngagementDB:
     # ---- findings ------------------------------------------------------
     def record_finding(self, target_id, title, severity="info",
                        description="", evidence="", cvss="",
-                       remediation="", attack_id="") -> int:
+                       remediation="", attack_id="",
+                       provenance="model-asserted", verified=0) -> int:
         cur = self._execute(
             "INSERT INTO findings(target_id, title, severity, description, evidence,"
-            " cvss, remediation, attack_id) VALUES (?,?,?,?,?,?,?,?)",
+            " cvss, remediation, attack_id, provenance, verified)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
             (target_id, title, severity, description, evidence,
-             cvss, remediation, attack_id),
+             cvss, remediation, attack_id, provenance, int(bool(verified))),
         )
-        with self._lock:
-            self.conn.commit()
         return cur.lastrowid
+
+    def set_finding_verdict(self, finding_id: int, verified: bool,
+                            refuter_note: str, status: str | None = None) -> None:
+        sql = "UPDATE findings SET verified = ?, refuter_note = ?"
+        params: list = [int(bool(verified)), refuter_note]
+        if status:
+            sql += ", status = ?"
+            params.append(status)
+        sql += " WHERE id = ?"
+        params.append(finding_id)
+        self._execute(sql, params)
+
+    def get_finding(self, finding_id: int):
+        return self.conn.execute("SELECT * FROM findings WHERE id = ?",
+                                 (finding_id,)).fetchone()
 
     # ---- loot ------------------------------------------------------------
     def record_loot(self, target_id, kind, title, value="",

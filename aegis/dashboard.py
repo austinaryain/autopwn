@@ -37,11 +37,24 @@ font-size:.75rem;color:#9fb3c8}
 <div class="card"><h2>Findings</h2><div id="findings"></div></div>
 <div class="card"><h2>Loot</h2><div id="loot"></div></div>
 </div>
+<div class="card" style="margin-top:1.2rem"><h2>Mission Control</h2>
+<form onsubmit="launch(event)">
+<input id="mhost" placeholder="in-scope target host" required>
+<select id="mmode"><option>scan</option><option>attack</option><option>mission</option></select>
+<button type="submit">Launch</button></form>
+<div id="missions" class="mono"></div></div>
 <div class="card" style="margin-top:1.2rem"><h2>Recent activity</h2>
 <div id="actions"></div></div>
 <script>
+const TOK = new URLSearchParams(location.search).get('token');
+async function launch(e){
+  e.preventDefault();
+  await fetch('/api/mission/start?token='+TOK, {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({host: mhost.value, mode: mmode.value})});
+}
 async function refresh(){
-  const s = await (await fetch('/api/state')).json();
+  const s = await (await fetch('/api/state?token='+TOK)).json();
   document.getElementById('targets').innerHTML = s.targets.map(t =>
     `<div><b>${t.host}</b> <span class="mono">${t.status}</span></div>`).join('') || 'none';
   document.getElementById('attack').innerHTML =
@@ -58,6 +71,9 @@ async function refresh(){
     `<div class="mono">[${a.ts}] <b>${a.agent}</b> ${a.command}
      — <span class="${a.exit_code==0?'ok':'fail'}">${a.status}</span></div>`
     ).join('') || 'none yet';
+  document.getElementById('missions').innerHTML = Object.entries(s.missions||{})
+    .map(([id,m]) => `<div>mission ${id}: <b>${m.mode}</b> ${m.host} — ${m.status}</div>`)
+    .join('') || 'no missions yet';
 }
 refresh(); setInterval(refresh, 3000);
 </script></body></html>"""
@@ -71,8 +87,28 @@ class DashboardServer:
         self.host = host
         self.port = port
         self.token = secrets.token_urlsafe(24)  # per-session bearer token
+        self.missions: dict[int, dict] = {}
+        self._mission_counter = 0
+        self.mission_handler = None  # callable(host, mode, on_event) set by shell
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+
+    def launch_mission(self, host: str, mode: str) -> int:
+        if self.mission_handler is None:
+            raise RuntimeError("no mission handler wired")
+        self._mission_counter += 1
+        mid = self._mission_counter
+        self.missions[mid] = {"host": host, "mode": mode, "status": "running"}
+
+        def work():
+            try:
+                self.mission_handler(host, mode)
+                self.missions[mid]["status"] = "complete"
+            except Exception as exc:
+                self.missions[mid]["status"] = f"error: {exc}"
+
+        threading.Thread(target=work, daemon=True).start()
+        return mid
 
     def _state(self) -> dict:
         conn = self.db.conn
@@ -98,7 +134,7 @@ class DashboardServer:
                    "succeeded": len(c["succeeded"])}
                   for t, c in cov.items() if c["tried"]]
         return {"targets": targets, "actions": actions, "findings": findings,
-                "loot": loot, "attack": attack}
+                "loot": loot, "attack": attack, "missions": self.missions}
 
     def start(self) -> str:
         page = PAGE
@@ -125,15 +161,40 @@ class DashboardServer:
                     body = json.dumps(self_server._state()).encode()
                     ctype = "application/json"
                 else:
-                    body = page.replace(
-                        "/api/state", f"/api/state?token={self_server.token}"
-                    ).encode()
+                    body = page.encode()
                     ctype = "text/html"
                 self.send_response(200)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+
+            def do_POST(self):
+                from urllib.parse import urlparse
+                if not self._authorized():
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                path = urlparse(self.path).path
+                if path == "/api/mission/start":
+                    length = int(self.headers.get("Content-Length", 0))
+                    data = json.loads(self.rfile.read(length) or b"{}")
+                    try:
+                        mid = self_server.launch_mission(
+                            str(data.get("host", "")), str(data.get("mode", "scan")))
+                        body = json.dumps({"mission_id": mid}).encode()
+                        code = 200
+                    except Exception as exc:
+                        body = json.dumps({"error": str(exc)}).encode()
+                        code = 400
+                    self.send_response(code)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
 
             def log_message(self, *args):  # silence
                 pass

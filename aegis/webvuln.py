@@ -77,6 +77,8 @@ class WebVulnPipeline:
                 cvss=classification.get("cvss-metrics", "") or "",
                 remediation=info.get("remediation", "") or "",
                 attack_id="T1595.002",
+                provenance="tool-proven",
+                verified=1,
             )
             count += 1
         return count

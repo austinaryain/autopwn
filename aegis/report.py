@@ -63,9 +63,26 @@ class ReportGenerator:
         L.append(f"- Attack attempts: **{attempts['c']}** "
                  f"(successful: **{attempts['s'] or 0}**)\n")
 
+        # Analyst attack narrative, if a mission produced one
+        narrative = self.db.conn.execute(
+            "SELECT value FROM loot WHERE kind='note' AND title='attack narrative'"
+            " ORDER BY id DESC LIMIT 1").fetchone()
+        if narrative and narrative["value"]:
+            L.append("## Attack Narrative\n")
+            L.append(narrative["value"])
+            L.append("")
+
         L.append("## Findings (by severity)\n")
-        if all_findings:
-            for i, f in enumerate(all_findings, 1):
+        # Only verified findings ship in the main section: tool-proven, or
+        # model-asserted findings that survived the refuter pass.
+        shippable = [f for f in all_findings
+                     if f["status"] != "rejected"
+                     and (f["verified"] or f["provenance"] == "tool-proven")]
+        unverified = [f for f in all_findings
+                      if f["status"] not in ("rejected",)
+                      and not (f["verified"] or f["provenance"] == "tool-proven")]
+        if shippable:
+            for i, f in enumerate(shippable, 1):
                 t = self.db.conn.execute("SELECT host FROM targets WHERE id = ?",
                                          (f["target_id"],)).fetchone()
                 L += [
@@ -73,6 +90,8 @@ class ReportGenerator:
                     f"- **Target:** {t['host'] if t else '?'}",
                     f"- **Discovered:** {f['ts']}",
                     f"- **Status:** {f['status']}",
+                    f"- **Provenance:** {f['provenance']}"
+                    + (" ✅" if f["verified"] else ""),
                 ]
                 if f["cvss"]:
                     L.append(f"- **CVSS:** `{f['cvss']}`")
@@ -84,7 +103,16 @@ class ReportGenerator:
                 if f["evidence"]:
                     L.append(f"- Evidence: `{f['evidence']}`")
         else:
-            L.append("_No findings recorded._")
+            L.append("_No verified findings recorded._")
+
+        if unverified:
+            L.append("\n## Appendix: Unverified Candidates\n")
+            L.append("_Model-asserted findings that have not passed "
+                     "verification — NOT part of the confirmed results._\n")
+            for f in unverified:
+                note = f" — refuter: {f['refuter_note']}" if f["refuter_note"] else ""
+                L.append(f"- ({f['severity']}) {f['title']} "
+                         f"[{f['status']}]{note}")
 
         # ATT&CK coverage section
         from .attack_map import coverage, render_coverage

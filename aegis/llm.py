@@ -10,6 +10,10 @@ import os
 
 import requests
 
+from .diag import get_logger
+
+log = get_logger("llm")
+
 
 class LLMError(Exception):
     pass
@@ -39,6 +43,7 @@ class LLMClient:
             r.raise_for_status()
             return r.json()["message"]["content"]
         except requests.RequestException as exc:
+            log.error("ollama chat failed: %s", exc)
             raise LLMError(f"Ollama backend error: {exc}") from exc
 
     def _openai_compatible(self, messages, json_mode) -> str:
@@ -52,12 +57,17 @@ class LLMClient:
             r.raise_for_status()
             return r.json()["choices"][0]["message"]["content"]
         except requests.RequestException as exc:
+            log.error("openai-compatible chat failed: %s", exc)
             raise LLMError(f"OpenAI-compatible backend error: {exc}") from exc
 
     def available(self) -> bool:
         try:
             if self.backend == "ollama":
-                return requests.get(f"{self.base_url}/api/tags", timeout=5).ok
+                ok = requests.get(f"{self.base_url}/api/tags", timeout=5).ok
+                if not ok:
+                    log.warning("ollama health check returned non-200")
+                return ok
             return True
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            log.warning("LLM backend unavailable: %s", exc)
             return False

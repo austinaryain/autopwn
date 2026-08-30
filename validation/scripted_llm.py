@@ -45,6 +45,13 @@ class ScriptedLLM:
         if "evaluate the output" in system:
             return json.dumps({"success": True, "summary": "llm-eval",
                                "interesting": [], "findings": [], "loot": []})
+        if "attack narrative" in user:
+            return ("## Attack narrative\nRecon mapped SSH and HTTP on the "
+                    "target; the exploiter validated SSH credentials via "
+                    "brute force, proving initial access.")
+        if "hostile reviewer" in system or "DISPROVE" in system:
+            return json.dumps({"verdict": "confirmed",
+                               "reason": "evidence supports the claim"})
         if "advisory chat mode" in user:
             return ("Recommended path: enumerate services, fingerprint the "
                     "web app, then brute-force SSH with hydra.")

@@ -14,8 +14,11 @@ from __future__ import annotations
 import json
 
 from .db import EngagementDB
+from .diag import get_logger
 from .llm import LLMClient, LLMError
 from .runner import Runner, RunnerError
+
+log = get_logger("agent")
 
 SYSTEM = """You are Aegis, an autonomous penetration-testing agent operating under a
 signed, written authorization limited to the declared engagement scope.
@@ -168,6 +171,7 @@ class Agent:
             try:
                 plan = self._plan(brief, target_row["host"], target_id)
             except LLMError as exc:
+                log.error("planner failed at step %s: %s", step, exc)
                 transcript.append({"step": step, "error": str(exc)})
                 break
 
@@ -185,6 +189,7 @@ class Agent:
             norm = f"{tool} {' '.join(sorted(args))}"
             if norm in seen_commands:
                 repeats += 1
+                log.warning("planner repeated command (x%s): %s", repeats, norm)
                 event = {"step": step, "phase": "skipped",
                          "command": norm,
                          "error": f"duplicate command (repeat #{repeats}) — "
@@ -222,6 +227,9 @@ class Agent:
 
             evaluation = self._assess(tool, result.command,
                                       self._full_output(result))
+            log.debug("step %s %s: status=%s source=%s success=%s",
+                      step, tool, result.status,
+                      evaluation.get("source"), evaluation.get("success"))
             success = bool(evaluation.get("success"))
             from .attack_map import tag_attempt
             attack_id, _tactic = tag_attempt(technique, vector, tool)
@@ -229,6 +237,8 @@ class Agent:
                                    evaluation.get("summary", ""), success,
                                    evidence=result.output_file or "",
                                    attack_id=attack_id)
+            provenance = "tool-proven" if evaluation.get("source") == "parser" \
+                else "model-asserted"
             for f in evaluation.get("findings", []):
                 self.db.record_finding(target_id, f.get("title", "untitled"),
                                        f.get("severity", "info"),
@@ -236,7 +246,9 @@ class Agent:
                                        evidence=result.output_file or "",
                                        cvss=f.get("cvss", ""),
                                        remediation=f.get("remediation", ""),
-                                       attack_id=attack_id)
+                                       attack_id=attack_id,
+                                       provenance=provenance,
+                                       verified=provenance == "tool-proven")
             for l in evaluation.get("loot", []):
                 kind = l.get("kind", "note")
                 if kind not in ("credential", "hash", "note"):

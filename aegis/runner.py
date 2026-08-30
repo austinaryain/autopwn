@@ -18,7 +18,10 @@ from pathlib import Path
 
 from .audit import AuditLog
 from .db import EngagementDB
+from .diag import get_logger
 from .scope import ScopeError, ScopeGate
+
+log = get_logger("runner")
 
 
 class RunnerError(Exception):
@@ -98,6 +101,7 @@ class Runner:
             try:
                 self.guard.validate(tool, [str(a) for a in args])
             except GuardError as exc:
+                log.warning("guard refused %s %s: %s", tool, args, exc)
                 self.audit.log(agent, "guard", "command_refused",
                                {"tool": tool, "args": args, "reason": str(exc)})
                 return RunResult(None, f"{tool} {' '.join(args)}", -1, 0.0, None,
@@ -108,6 +112,7 @@ class Runner:
             try:
                 self.scope.check(target_host)
             except ScopeError as exc:
+                log.warning("scope refused %s: %s", target_host, exc)
                 self.audit.log(agent, "scope", "out_of_scope_refused",
                                {"host": target_host, "tool": tool, "error": str(exc)})
                 return RunResult(None, f"{tool} {' '.join(args)}", -1, 0.0, None,
@@ -158,6 +163,7 @@ class Runner:
             exit_code = proc.returncode
             out = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr else "")
         except subprocess.TimeoutExpired as tex:
+            log.warning("timeout after %ss: %s", timeout, tool)
             exit_code = -9
             status = "timeout"
             out = (tex.stdout or "") if isinstance(tex.stdout, str) else ""
@@ -166,6 +172,8 @@ class Runner:
         if status == "ok" and exit_code != 0:
             status = "error"
         out = sanitize_output(out)
+        log.debug("exec %s exit=%s %.1fs status=%s", tool, exit_code,
+                  duration, status)
 
         # 6. persist output + records
         action_id = self.db.record_action(
