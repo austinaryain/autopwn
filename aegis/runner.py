@@ -11,6 +11,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import time
@@ -22,6 +23,26 @@ from .diag import get_logger
 from .scope import ScopeError, ScopeGate
 
 log = get_logger("runner")
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the process AND its children. Wrapper shells (/bin/sh scripts,
+    proxychains) spawn grandchildren that inherit our stdout/stderr pipes —
+    killing only the direct child leaves the pipes open and communicate()
+    hangs until the grandchild exits. POSIX: kill the whole process group
+    (Popen uses start_new_session). Windows: taskkill the tree."""
+    try:
+        if os.name == "posix":
+            import signal
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        else:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 class RunnerError(Exception):
@@ -78,16 +99,13 @@ class Runner:
         self.active_procs: dict[int, subprocess.Popen] = {}
 
     def cancel_all(self) -> int:
-        """Kill every running tool process. Returns count killed."""
+        """Kill every running tool process (whole trees). Returns count."""
         with self._active_lock:
             procs = list(self.active_procs.values())
         for p in procs:
-            try:
-                p.kill()
-            except OSError:
-                pass
+            _kill_tree(p)
         if procs:
-            log.warning("cancel_all killed %d process(es)", len(procs))
+            log.warning("cancel_all killed %d process tree(s)", len(procs))
         return len(procs)
 
     # ---- transport checks ----------------------------------------------
@@ -184,8 +202,10 @@ class Runner:
         timeout = timeout or self.default_timeout
         t0 = time.time()
         status, out = "ok", ""
+        # own session on POSIX so _kill_tree can SIGKILL the whole group
+        popen_kw = {"start_new_session": True} if os.name == "posix" else {}
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True)
+                                stderr=subprocess.PIPE, text=True, **popen_kw)
         with self._active_lock:
             self.active_procs[proc.pid] = proc
         try:
@@ -197,17 +217,23 @@ class Runner:
                     break
                 except subprocess.TimeoutExpired:
                     if cancel_event is not None and cancel_event.is_set():
-                        proc.kill()
-                        proc.communicate()
+                        _kill_tree(proc)
+                        try:
+                            proc.communicate(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            pass
                         exit_code = -15
                         status = "cancelled"
                         out = "[CANCELLED by operator]"
-                        log.warning("process killed by operator: %s (pid %s)",
+                        log.warning("process tree killed by operator: %s (pid %s)",
                                     tool, proc.pid)
                         break
                     if time.time() - t0 > timeout:
-                        proc.kill()
-                        stdout, stderr = proc.communicate()
+                        _kill_tree(proc)
+                        try:
+                            stdout, stderr = proc.communicate(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            stdout, stderr = "", ""
                         log.warning("timeout after %ss: %s", timeout, tool)
                         exit_code = -9
                         status = "timeout"
