@@ -87,6 +87,20 @@ Two logging layers, two different questions:
 
 First run on Kali: `bash setup_kali.sh` — checks/installs everything, pulls the Ollama model, walks you through scoping `authorization.json`, and gates on the full test suite + simulation validation before declaring readiness.
 
+## v1.2 — one-click playbook recommendations
+
+Every recommendation in the Target Command Center now carries **▶ run**
+buttons: the server extracts concrete, allowlisted commands from each hint
+(hover the button to see the exact command), and clicking one executes it
+through the full safety path — allowlist → guard (flag/grounding checks) →
+scope gate → audit — in the background, with the result appearing in Recent
+Activity seconds later.
+
+Extraction is conservative by design: template commands with placeholders
+(`WORDLIST`, `<user>`) get no button, prose like "check /robots.txt" is never
+mistaken for a command, and unbalanced-quote fragments are dropped. Local
+research commands (`searchsploit`) get buttons too — they need no target.
+
 ## v1.1 — reports that show the intelligence
 
 Client deliverables now carry everything the engagement learned:

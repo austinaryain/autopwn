@@ -339,3 +339,47 @@ def hints_for(intel_items: list[dict], loot: list[dict] | None = None,
             seen.add(h)
             out.append(h)
     return out[:15]
+
+
+# ---- one-click execution: extract runnable commands from hints ---------------
+
+# delimiters that end a command segment inside a hint's prose
+_CMD_DELIMS = [";", " / ", " or run ", " then ", " or ", " — ", " (", "\n",
+               "→"]
+# placeholder tokens that mark a template, not a runnable command
+_CMD_PLACEHOLDERS = ("WORDLIST", "<", ">", "users.txt", "passwords.txt")
+
+
+def extract_commands(hint: str, allowed_tools) -> list[str]:
+    """Pull runnable commands out of a hint's prose.
+
+    A command starts at an allowlisted tool name and ends at the next prose
+    delimiter. Segments containing placeholder tokens (WORDLIST, <user>…)
+    or unbalanced quotes are skipped — they are templates, not commands."""
+    tools = sorted((str(t) for t in allowed_tools), key=len, reverse=True)
+    if not tools:
+        return []
+    rx = re.compile(r"\b(" + "|".join(re.escape(t) for t in tools) + r")\b")
+    commands: list[str] = []
+    for m in rx.finditer(hint):
+        seg = hint[m.start():]
+        cut = len(seg)
+        for delim in _CMD_DELIMS:
+            i = seg.find(delim)
+            if i > 0:
+                cut = min(cut, i)
+        cmd = seg[:cut].strip().rstrip(" .,")
+        if not cmd or any(p in cmd for p in _CMD_PLACEHOLDERS):
+            continue
+        if cmd.count("'") % 2 or cmd.count('"') % 2:
+            continue  # unbalanced quotes after cutting — not safe to run
+        if len(cmd) > 300:
+            continue
+        commands.append(cmd)
+    # dedupe, preserve order
+    seen, out = set(), []
+    for c in commands:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out

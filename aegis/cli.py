@@ -213,6 +213,31 @@ class Shell:
         except RunnerError as exc:
             self.console.print(f"[red]{exc}[/]")
 
+    def _quick_run_handler(self, host: str, command: str):
+        """War Room one-click: run an extracted hint command through the full
+        runner path (allowlist → guard → scope → audit) in the background."""
+        import shlex
+        import threading
+        from .diag import get_logger
+        log = get_logger("war-room")
+
+        def work():
+            try:
+                parts = shlex.split(command)
+                if not parts:
+                    return
+                tool, targs = parts[0], parts[1:]
+                row = self.db.get_target(host)
+                tid = row["id"] if row else self.db.add_target(host)
+                result = self.runner.run(tool, targs, target_host=host,
+                                         target_id=tid, agent="war-room")
+                log.info("one-click %s: %s (exit %s)",
+                         result.status, command, result.exit_code)
+            except (RunnerError, ValueError) as exc:
+                log.warning("one-click failed: %s — %s", command, exc)
+
+        threading.Thread(target=work, daemon=True).start()
+
     def cmd_findings(self, args):
         row = self.db.get_target(args[0]) if args else None
         findings = self.db.findings_for(row["id"]) if row else self.db.findings_for()
@@ -430,6 +455,8 @@ class Shell:
         self.dashboard = DashboardServer(self.db, port=port)
         self.dashboard.mission_handler = self._mission_handler
         self.dashboard.scope_handler = self._scope_handler
+        self.dashboard.run_handler = self._quick_run_handler
+        self.dashboard.allowed_tools = sorted(self.runner.allowed_tools)
         self.dashboard.audit = self.audit
         url = self.dashboard.start()
         self.audit.log("operator", "dashboard", "start", {"url": url})

@@ -151,14 +151,29 @@ function lootLine(l){
 }
 // ---- Target Command Center --------------------------------------------------
 let SEL = null;
+let LAST_DETAIL = null;  // last /api/target payload (hint commands live here)
 async function selectTarget(id){ SEL = id; await loadDetail(); }
 async function loadDetail(){
   if (SEL == null) return;
   try {
     const d = await (await fetch('/api/target?id='+SEL+'&token='+TOK)).json();
     if (d.error){ document.getElementById('detail').textContent = d.error; return; }
+    LAST_DETAIL = d;
     renderDetail(d);
   } catch(e){ /* transient — next refresh retries */ }
+}
+async function runHint(hi, ci, el){
+  const d = LAST_DETAIL; if (!d) return;
+  const cmd = ((d.hint_commands||[])[hi]||[])[ci]; if (!cmd) return;
+  el.textContent = '⏳'; el.style.pointerEvents = 'none';
+  try {
+    const r = await fetch('/api/run?token='+TOK, {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({host: d.target.host, command: cmd})});
+    const j = await r.json();
+    el.textContent = j.started ? '✔ started' : '✘ '+(j.error||'failed');
+  } catch(e){ el.textContent = '✘ '+e; }
+  setTimeout(refresh, 800);
 }
 async function showLog(id){
   const r = await fetch('/api/action/log?id='+id+'&token='+TOK);
@@ -175,8 +190,14 @@ function renderDetail(d){
     <span class="mono">${esc(t.status)}</span>
     <span class="mono">${esc(t.description||'')}</span></div>`;
   if (d.hints && d.hints.length) {
-    h += '<h2>Playbook recommendations</h2>' + d.hints.map(x=>
-      `<div class="mono" style="margin:.15rem 0">▸ ${esc(x)}</div>`).join('');
+    h += '<h2>Playbook recommendations</h2>' + d.hints.map((x,hi)=>{
+      const cmds = (d.hint_commands||[])[hi]||[];
+      const btns = cmds.map((c,ci)=>
+        ` <a href="#" onclick="runHint(${hi},${ci},this);return false"
+           title="${esc(c)}" style="color:#5aff8a;font-size:.72rem;white-space:nowrap">▶ run</a>`
+      ).join('');
+      return `<div class="mono" style="margin:.15rem 0">▸ ${esc(x)}${btns}</div>`;
+    }).join('');
   }
   h += '<h2>Infrastructure</h2>';
   h += svc.length
@@ -247,6 +268,8 @@ class DashboardServer:
         self._mission_counter = 0
         self.mission_handler = None  # callable(host, mode, cancel_event)
         self.scope_handler = None    # callable(host, network) — set by shell
+        self.run_handler = None      # callable(host, command_str) — set by shell
+        self.allowed_tools: list[str] = []  # for hint command extraction
         self.audit = None            # optional AuditLog — set by shell
         self.workspace = "."         # engagement dir (playbook.custom.json)
         self._server: ThreadingHTTPServer | None = None
@@ -349,14 +372,16 @@ class DashboardServer:
             " FROM actions WHERE target_id = ? ORDER BY id DESC LIMIT 50",
             (target_id,)).fetchall()]
         # what the knowledge base recommends for this exact target right now
-        from .playbook import hints_for
+        from .playbook import extract_commands, hints_for
         host = t["host"]
         hints = [h.replace("TARGET", host)
                  for h in hints_for(intel, loot=loot, target=host,
                                     workspace=self.workspace)]
+        hint_commands = [extract_commands(h, self.allowed_tools)
+                         for h in hints]
         return {"target": dict(t), "intel": intel, "findings": findings,
                 "loot": loot, "attempts": attempts, "actions": actions,
-                "hints": hints}
+                "hints": hints, "hint_commands": hint_commands}
 
     def _playbook_state(self) -> dict:
         from .playbook import list_custom_rules, load_kb
@@ -512,6 +537,19 @@ class DashboardServer:
                     except (ValueError, TypeError) as exc:
                         code, body = 400, json.dumps(
                             {"error": str(exc)}).encode()
+                elif path == "/api/run":
+                    if self_server.run_handler is None:
+                        code, body = 400, json.dumps(
+                            {"error": "no run handler wired"}).encode()
+                    else:
+                        try:
+                            self_server.run_handler(str(data.get("host", "")),
+                                                    str(data.get("command", "")))
+                            code, body = 200, json.dumps(
+                                {"started": True}).encode()
+                        except Exception as exc:
+                            code, body = 400, json.dumps(
+                                {"error": str(exc)}).encode()
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
