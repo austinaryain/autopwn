@@ -428,6 +428,7 @@ class Shell:
         self.dashboard = DashboardServer(self.db, port=port)
         self.dashboard.mission_handler = self._mission_handler
         self.dashboard.scope_handler = self._scope_handler
+        self.dashboard.audit = self.audit
         url = self.dashboard.start()
         self.audit.log("operator", "dashboard", "start", {"url": url})
         self.console.print(f"[green]War Room live at {url}[/] (auto-refreshes; "

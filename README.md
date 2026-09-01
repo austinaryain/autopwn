@@ -87,6 +87,15 @@ Two logging layers, two different questions:
 
 First run on Kali: `bash setup_kali.sh` — checks/installs everything, pulls the Ollama model, walks you through scoping `authorization.json`, and gates on the full test suite + simulation validation before declaring readiness.
 
+## v0.6 — diagnosability (field feedback, round 2)
+
+| Feature | Detail |
+|---|---|
+| **Error reasons everywhere** | Failed actions now store a compact reason (stderr tail, timeout, cancel, bare exit code) in a new `actions.error` column. The War Room's Recent Activity shows it inline under the failed command — no more mystery "error" rows. |
+| **The planner learns from failures** | `memory_summary` feeds the one-line failure reason back to the LLM, so the next planned step adapts (e.g. drops a nonexistent NSE script) instead of retrying the same broken command. |
+| **Loot reveal that sticks** | Revealed values are cached client-side and survive the 3 s auto-refresh; failures surface as inline `⚠` messages instead of silently doing nothing. Reveals from the War Room are audit-logged (`war-room / loot / view`) just like `/loot show`. |
+| **Injection hardening** | All target-influenced fields (command output, error text, loot, titles) are HTML-escaped before rendering — a hostile target banner can't inject markup into the operator's browser. Malformed `/api/loot` requests get a JSON error instead of a dropped connection. |
+
 ## v0.5 — operator UX (TryHackMe field feedback)
 
 Driven by real lab usage — less typing, full control, loot at your fingertips:

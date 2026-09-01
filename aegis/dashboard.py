@@ -54,6 +54,9 @@ font-size:.75rem;color:#9fb3c8}
 <div id="actions"></div></div>
 <script>
 const TOK = new URLSearchParams(location.search).get('token');
+const REVEALED = {};  // loot id -> revealed value; survives the 3s refresh
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,
+  c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 async function launch(e){
   e.preventDefault();
   await fetch('/api/mission/start?token='+TOK, {method:'POST',
@@ -73,33 +76,41 @@ async function stopMission(id){
   await fetch('/api/mission/stop?token='+TOK, {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})});
 }
-async function revealLoot(id, el){
-  const r = await fetch('/api/loot?id='+id+'&reveal=1&token='+TOK);
-  const j = await r.json();
-  el.outerHTML = '<span class="mono">'+(j.value||j.file_path||'')+'</span>';
+async function revealLoot(id){
+  try {
+    const r = await fetch('/api/loot?id='+id+'&reveal=1&token='+TOK);
+    const j = await r.json();
+    REVEALED[id] = j.error ? '⚠ '+j.error
+                           : (j.value || j.file_path || '(no value stored)');
+  } catch(e) { REVEALED[id] = '⚠ reveal failed: '+e; }
+  refresh();
 }
 async function refresh(){
   const s = await (await fetch('/api/state?token='+TOK)).json();
   document.getElementById('targets').innerHTML = s.targets.map(t =>
-    `<div><b>${t.host}</b> <span class="mono">${t.status}</span></div>`).join('') || 'none';
+    `<div><b>${esc(t.host)}</b> <span class="mono">${esc(t.status)}</span></div>`).join('') || 'none';
   document.getElementById('attack').innerHTML =
     '<table>' + s.attack.map(a =>
-      `<tr><td>${a.tactic}</td><td>${a.tried}</td><td class="ok">${a.succeeded}</td></tr>`
+      `<tr><td>${esc(a.tactic)}</td><td>${a.tried}</td><td class="ok">${a.succeeded}</td></tr>`
     ).join('') + '</table>';
   document.getElementById('findings').innerHTML = s.findings.map(f =>
-    `<div class="sev-${f.severity}">[${f.severity.toUpperCase()}] ${f.title}
-     <span class="mono">${f.host||''}</span></div>`).join('') || 'none yet';
-  document.getElementById('loot').innerHTML = s.loot.map(l =>
-    `<div>(${l.kind}) ${l.title} <span class="mono">${l.value}</span>
-     <a href="#" onclick="revealLoot(${l.id},this);return false"
-        style="color:#5aa0ff;font-size:.75rem">reveal</a></div>`
-    ).join('') || 'none yet';
+    `<div class="sev-${f.severity}">[${f.severity.toUpperCase()}] ${esc(f.title)}
+     <span class="mono">${esc(f.host||'')}</span></div>`).join('') || 'none yet';
+  document.getElementById('loot').innerHTML = s.loot.map(l => {
+    const shown = REVEALED[l.id] !== undefined ? REVEALED[l.id] : (l.value||'');
+    const link = REVEALED[l.id] !== undefined ? '' :
+      ` <a href="#" onclick="revealLoot(${l.id});return false"
+         style="color:#5aa0ff;font-size:.75rem">reveal</a>`;
+    return `<div>(${esc(l.kind)}) ${esc(l.title)} <span class="mono">${esc(shown)}</span>${link}</div>`;
+  }).join('') || 'none yet';
   document.getElementById('actions').innerHTML = s.actions.map(a =>
-    `<div class="mono">[${a.ts}] <b>${a.agent}</b> ${a.command}
-     — <span class="${a.exit_code==0?'ok':'fail'}">${a.status}</span></div>`
-    ).join('') || 'none yet';
+    `<div class="mono">[${a.ts}] <b>${esc(a.agent)}</b> ${esc(a.command)}
+     — <span class="${a.exit_code==0?'ok':'fail'}">${a.status}${
+       a.exit_code ? ' (exit '+a.exit_code+')' : ''}</span></div>` +
+    (a.error ? `<div class="fail mono" style="white-space:pre-wrap;margin:0 0 .5rem 1rem">${esc(a.error)}</div>` : '')
+  ).join('') || 'none yet';
   document.getElementById('missions').innerHTML = Object.entries(s.missions||{})
-    .map(([id,m]) => `<div>mission ${id}: <b>${m.mode}</b> ${m.host} — ${m.status}` +
+    .map(([id,m]) => `<div>mission ${id}: <b>${esc(m.mode)}</b> ${esc(m.host)} — ${esc(m.status)}` +
       (m.status==='running' ?
        ` <a href="#" onclick="stopMission(${id});return false"
           style="color:#ff5a5a">■ stop</a>` : '') + `</div>`)
@@ -121,6 +132,7 @@ class DashboardServer:
         self._mission_counter = 0
         self.mission_handler = None  # callable(host, mode, cancel_event)
         self.scope_handler = None    # callable(host, network) — set by shell
+        self.audit = None            # optional AuditLog — set by shell
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -133,6 +145,8 @@ class DashboardServer:
         value = decrypted["value"] or ""
         if not reveal and decrypted["kind"] in ("credential", "hash"):
             value = "••••••" + value[-4:] if len(value) >= 4 else "••••••"
+        if reveal and self.audit is not None:
+            self.audit.log("war-room", "loot", "view", {"id": loot_id})
         return {"id": row["id"], "kind": row["kind"], "title": row["title"],
                 "value": value, "file_path": row["file_path"],
                 "revealed": reveal}
@@ -174,7 +188,7 @@ class DashboardServer:
         conn = self.db.conn
         targets = [dict(r) for r in self.db.list_targets()]
         actions = [dict(r) for r in conn.execute(
-            "SELECT ts, agent, command, exit_code, status FROM actions"
+            "SELECT ts, agent, command, exit_code, status, error FROM actions"
             " ORDER BY id DESC LIMIT 25").fetchall()]
         findings = []
         for f in self.db.findings_for():
@@ -225,11 +239,14 @@ class DashboardServer:
                     ctype = "application/json"
                 elif path == "/api/loot":
                     from urllib.parse import urlparse, parse_qs
-                    q = parse_qs(urlparse(self.path).query)
-                    loot_id = int(q.get("id", ["0"])[0])
-                    reveal = q.get("reveal", ["0"])[0] == "1"
-                    body = json.dumps(
-                        self_server._loot_item(loot_id, reveal)).encode()
+                    try:
+                        q = parse_qs(urlparse(self.path).query)
+                        loot_id = int(q.get("id", ["0"])[0])
+                        reveal = q.get("reveal", ["0"])[0] == "1"
+                        body = json.dumps(
+                            self_server._loot_item(loot_id, reveal)).encode()
+                    except (ValueError, TypeError) as exc:
+                        body = json.dumps({"error": f"bad request: {exc}"}).encode()
                     ctype = "application/json"
                 else:
                     body = page.encode()

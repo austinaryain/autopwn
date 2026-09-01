@@ -212,9 +212,22 @@ class Runner:
         log.debug("exec %s exit=%s %.1fs status=%s", tool, exit_code,
                   duration, status)
 
+        # compact failure reason — surfaced in dashboard, CLI and agent memory
+        error_summary = ""
+        if status != "ok":
+            if status == "cancelled":
+                error_summary = "cancelled by operator"
+            else:
+                src = out.split("\n[stderr]\n", 1)[-1] if "\n[stderr]\n" in out else out
+                tail = [ln for ln in src.strip().splitlines() if ln.strip()]
+                error_summary = "\n".join(tail[-8:])[:400]
+                if not error_summary:
+                    error_summary = f"exit code {exit_code} with no output"
+
         # 6. persist output + records
         action_id = self.db.record_action(
-            target_id, agent, tool, cmd_str, exit_code, duration, None, status)
+            target_id, agent, tool, cmd_str, exit_code, duration, None, status,
+            error=error_summary)
         output_file = self.output_dir / f"action-{action_id}.log"
         output_file.write_text(f"$ {cmd_str}\n(exit {exit_code}, {duration:.1f}s)\n\n{out}",
                                encoding="utf-8", errors="replace")

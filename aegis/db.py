@@ -92,6 +92,7 @@ MIGRATIONS = [
     ("findings", "provenance", "ALTER TABLE findings ADD COLUMN provenance TEXT DEFAULT 'model-asserted'"),
     ("findings", "verified", "ALTER TABLE findings ADD COLUMN verified INTEGER DEFAULT 0"),
     ("findings", "refuter_note", "ALTER TABLE findings ADD COLUMN refuter_note TEXT DEFAULT ''"),
+    ("actions", "error", "ALTER TABLE actions ADD COLUMN error TEXT DEFAULT ''"),
 ]
 
 
@@ -153,12 +154,12 @@ class EngagementDB:
 
     # ---- actions -------------------------------------------------------
     def record_action(self, target_id, agent, tool, command, exit_code,
-                      duration_sec, output_file, status) -> int:
+                      duration_sec, output_file, status, error="") -> int:
         cur = self._execute(
             "INSERT INTO actions(target_id, agent, tool, command, exit_code,"
-            " duration_sec, output_file, status) VALUES (?,?,?,?,?,?,?,?)",
+            " duration_sec, output_file, status, error) VALUES (?,?,?,?,?,?,?,?,?)",
             (target_id, agent, tool, command, exit_code, duration_sec,
-             output_file, status),
+             output_file, status, error),
         )
         with self._lock:
             self.conn.commit()
@@ -281,13 +282,18 @@ class EngagementDB:
         """Compact text digest of everything known about a target — fed to the LLM."""
         lines: list[str] = []
         actions = self.conn.execute(
-            "SELECT tool, command, exit_code, status FROM actions"
+            "SELECT tool, command, exit_code, status, error FROM actions"
             " WHERE target_id = ? ORDER BY id DESC LIMIT 30", (target_id,)
         ).fetchall()
         if actions:
             lines.append("## Recent actions (newest first)")
             for a in actions:
-                lines.append(f"- [{a['status']}] `{a['command']}` (exit {a['exit_code']})")
+                entry = f"- [{a['status']}] `{a['command']}` (exit {a['exit_code']})"
+                if a["status"] != "ok" and a["error"]:
+                    # one-line reason so the planner can adapt, not retry blindly
+                    reason = " ".join(a["error"].split())[:160]
+                    entry += f" — reason: {reason}"
+                lines.append(entry)
         attempts = self.attempts_for(target_id)
         if attempts:
             lines.append("## Attack attempts")
