@@ -56,6 +56,8 @@ Commands:
   /missions                   list running/finished missions
   /stop <id|all>              stop a running mission / kill all processes
   /hashes <outfile>           export captured hashes for john/hashcat
+  /kb [add <group> <pat> <hint>]  list/add playbook knowledge-base rules
+  /kb promote|dismiss <n>     review auto-learned rule drafts
   /map [host]                 MITRE ATT&CK coverage heatmap
   /webvuln <host>             web pipeline: discover HTTP + nuclei scan
   /privesc <host>             privesc research (searchsploit vs. memory)
@@ -567,6 +569,74 @@ class Shell:
         except Exception as exc:
             self.console.print(f"[red]{exc}[/]")
 
+    def cmd_kb(self, args):
+        """/kb — list KB + drafts. /kb add <group> <pat> <hint>.
+        /kb promote <n> | /kb dismiss <n> — review learned drafts."""
+        from .playbook import (add_custom_rule, dismiss_draft,
+                               list_custom_rules, load_kb, promote_draft)
+        if args and args[0] == "add":
+            if len(args) < 4:
+                return self.console.print(
+                    "[red]usage: /kb add <version_hints|service_hints|"
+                    "port_hints> <pattern|port> <hint>[/]")
+            group, pattern, hint = args[1], args[2], " ".join(args[3:])
+            try:
+                add_custom_rule(".", group, pattern, hint)
+                self.audit.log("operator", "playbook", "add_rule",
+                               {"group": group, "pattern": pattern})
+                self.console.print("[green]Rule added[/] — live for the next "
+                                   "planning step (hot-reloaded)")
+            except ValueError as exc:
+                self.console.print(f"[red]{exc}[/]")
+            return
+        if args and args[0] in ("promote", "dismiss"):
+            if len(args) < 2 or not args[1].isdigit():
+                return self.console.print(f"[red]usage: /kb {args[0]} <n>[/]")
+            try:
+                fn = promote_draft if args[0] == "promote" else dismiss_draft
+                d = fn(".", int(args[1]))
+                self.audit.log("operator", "playbook",
+                               f"{args[0]}_rule", {"pattern": d["pattern"]})
+                verb = "promoted to live rules" if args[0] == "promote" \
+                    else "dismissed"
+                self.console.print(f"[green]Draft {verb}:[/] {d['pattern']}")
+            except ValueError as exc:
+                self.console.print(f"[red]{exc}[/]")
+            return
+        kb = load_kb(".")
+        custom = list_custom_rules(".")
+        self.console.print(
+            f"[bold]Bundled:[/] {len(kb['version_hints'])} version-exploit, "
+            f"{len(kb['service_hints'])} service, "
+            f"{len(kb['port_hints'])} port-fallback rules")
+        drafts = custom.get("drafts", [])
+        if drafts:
+            table = Table(title="⏳ Learned drafts — /kb promote <n> or "
+                                "/kb dismiss <n>")
+            table.add_column("#")
+            table.add_column("group")
+            table.add_column("pattern")
+            table.add_column("hint", overflow="fold")
+            for i, d in enumerate(drafts):
+                table.add_row(str(i), d["group"], d["pattern"], d["hint"])
+            self.console.print(table)
+        rows = ([(g, r[0], r[1]) for g in ("version_hints", "service_hints")
+                 for r in custom.get(g, [])]
+                + [("port_hints", k, v)
+                   for k, v in custom.get("port_hints", {}).items()])
+        if not rows and not drafts:
+            self.console.print("[dim]No custom rules — add one with "
+                               "/kb add or from the War Room.[/]")
+            return
+        if rows:
+            table = Table(title="Custom playbook rules (fire first)")
+            table.add_column("group")
+            table.add_column("pattern")
+            table.add_column("hint", overflow="fold")
+            for g, p, htext in rows:
+                table.add_row(g, p, htext)
+            self.console.print(table)
+
     def cmd_loot_show(self, loot_id: int):
         row = self.db.conn.execute("SELECT * FROM loot WHERE id = ?",
                                    (loot_id,)).fetchone()
@@ -697,6 +767,8 @@ class Shell:
                     self.cmd_logs(args)
                 elif cmd == "authorize":
                     self.cmd_authorize(args)
+                elif cmd == "kb":
+                    self.cmd_kb(args)
                 elif cmd == "missions":
                     self.cmd_missions()
                 elif cmd == "stop":

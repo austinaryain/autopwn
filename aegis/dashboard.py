@@ -56,6 +56,16 @@ border-radius:4px;padding:.05rem .45rem;margin:.12rem;font-size:.72rem}
 <button type="submit">Authorize</button></form>
 <div id="scopemsg" class="mono"></div>
 <div class="mono">Adds to authorization.json (audited) and registers the target.</div></div>
+<div class="card" style="margin-top:1.2rem"><h2>Playbook Knowledge Base</h2>
+<form onsubmit="addKb(event)">
+<select id="kbgroup"><option value="version_hints">version exploit</option>
+<option value="service_hints">service playbook</option>
+<option value="port_hints">port fallback</option></select>
+<input id="kbpattern" placeholder="regex on service string, or port (e.g. 6379)" required style="width:34%">
+<input id="kbhint" placeholder="attack hint — use TARGET as host placeholder" required style="width:38%">
+<button type="submit">Add rule</button></form>
+<div id="kbmsg" class="mono"></div>
+<div id="kbrules" class="mono"></div></div>
 <div class="card" style="margin-top:1.2rem"><h2>Recent activity</h2>
 <div id="actions"></div></div>
 <div class="card" style="margin-top:1.2rem"><h2>Target Command Center</h2>
@@ -81,6 +91,43 @@ async function addScope(e){
   const j = await r.json();
   document.getElementById('scopemsg').textContent =
     j.added ? '✔ authorized: '+shost.value : '✘ '+(j.error||'failed');
+}
+async function addKb(e){
+  e.preventDefault();
+  const r = await fetch('/api/playbook/add?token='+TOK, {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({group: kbgroup.value, pattern: kbpattern.value,
+                          hint: kbhint.value})});
+  const j = await r.json();
+  document.getElementById('kbmsg').textContent =
+    j.added ? '✔ rule added — live for the next planning step'
+            : '✘ '+(j.error||'failed');
+  if (j.added){ kbpattern.value=''; kbhint.value=''; }
+  loadKb();
+}
+async function kbAction(op, i){
+  await fetch('/api/playbook/'+op+'?token='+TOK, {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({index:i})});
+  loadKb();
+}
+async function loadKb(){
+  try {
+    const j = await (await fetch('/api/playbook?token='+TOK)).json();
+    const b = j.bundled, c = j.custom;
+    const custom = (c.version_hints||[]).map(r=>['version',...r])
+      .concat((c.service_hints||[]).map(r=>['service',...r]))
+      .concat(Object.entries(c.port_hints||{}).map(([k,v])=>['port',k,v]));
+    const drafts = (c.drafts||[]);
+    document.getElementById('kbrules').innerHTML =
+      `<div>${b.version_hints} version + ${b.service_hints} service + `+
+      `${b.port_hints} port rules bundled — custom rules fire first, hot-reloaded</div>` +
+      (drafts.length ? '<div style="margin-top:.4rem;color:#ffd93c">⏳ learned drafts — review before they go live:</div>' +
+        drafts.map((d,i)=>`<div>✎ <b>${d.group}</b> <span class="mono">${esc(d.pattern)}</span> → ${esc(d.hint)}
+          <a href="#" onclick="kbAction('promote',${i});return false" style="color:#5aff8a">promote</a>
+          <a href="#" onclick="kbAction('dismiss',${i});return false" style="color:#ff7a7a">dismiss</a></div>`).join('') : '') +
+      (custom.map(r=>`<div>· <b>${r[0]}</b> <span class="mono">${esc(r[1])}</span> → ${esc(r[2])}</div>`).join('') ||
+       '<div>no live custom rules yet</div>');
+  } catch(e){ /* transient */ }
 }
 async function stopMission(id){
   await fetch('/api/mission/stop?token='+TOK, {method:'POST',
@@ -127,6 +174,10 @@ function renderDetail(d){
   let h = `<div><b style="font-size:1.05rem">${esc(t.host)}</b>
     <span class="mono">${esc(t.status)}</span>
     <span class="mono">${esc(t.description||'')}</span></div>`;
+  if (d.hints && d.hints.length) {
+    h += '<h2>Playbook recommendations</h2>' + d.hints.map(x=>
+      `<div class="mono" style="margin:.15rem 0">▸ ${esc(x)}</div>`).join('');
+  }
   h += '<h2>Infrastructure</h2>';
   h += svc.length
     ? '<table><tr><th>port</th><th>service / version</th></tr>' +
@@ -178,6 +229,7 @@ async function refresh(){
           style="color:#ff5a5a">■ stop</a>` : '') + `</div>`)
     .join('') || 'no missions yet';
   if (SEL != null) loadDetail();
+  loadKb();
 }
 refresh(); setInterval(refresh, 3000);
 </script></body></html>"""
@@ -196,6 +248,7 @@ class DashboardServer:
         self.mission_handler = None  # callable(host, mode, cancel_event)
         self.scope_handler = None    # callable(host, network) — set by shell
         self.audit = None            # optional AuditLog — set by shell
+        self.workspace = "."         # engagement dir (playbook.custom.json)
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -295,8 +348,23 @@ class DashboardServer:
             "SELECT id, ts, agent, command, exit_code, status, error"
             " FROM actions WHERE target_id = ? ORDER BY id DESC LIMIT 50",
             (target_id,)).fetchall()]
+        # what the knowledge base recommends for this exact target right now
+        from .playbook import hints_for
+        host = t["host"]
+        hints = [h.replace("TARGET", host)
+                 for h in hints_for(intel, loot=loot, target=host,
+                                    workspace=self.workspace)]
         return {"target": dict(t), "intel": intel, "findings": findings,
-                "loot": loot, "attempts": attempts, "actions": actions}
+                "loot": loot, "attempts": attempts, "actions": actions,
+                "hints": hints}
+
+    def _playbook_state(self) -> dict:
+        from .playbook import list_custom_rules, load_kb
+        kb = load_kb(self.workspace)
+        return {"bundled": {g: len(kb.get(g, [])) for g in
+                            ("version_hints", "service_hints", "port_hints",
+                             "wordlists")},
+                "custom": list_custom_rules(self.workspace)}
 
     def _action_log(self, action_id: int) -> str:
         row = self.db.conn.execute(
@@ -366,6 +434,9 @@ class DashboardServer:
                     except (ValueError, TypeError) as exc:
                         body = f"(bad request: {exc})".encode()
                     ctype = "text/plain; charset=utf-8"
+                elif path == "/api/playbook":
+                    body = json.dumps(self_server._playbook_state()).encode()
+                    ctype = "application/json"
                 else:
                     body = page.encode()
                     ctype = "text/html"
@@ -408,6 +479,39 @@ class DashboardServer:
                         except Exception as exc:
                             code, body = 400, json.dumps(
                                 {"error": str(exc)}).encode()
+                elif path == "/api/playbook/add":
+                    from .playbook import add_custom_rule
+                    try:
+                        group = str(data.get("group", ""))
+                        pattern = str(data.get("pattern", ""))
+                        hint = str(data.get("hint", ""))
+                        add_custom_rule(self_server.workspace, group,
+                                        pattern, hint)
+                        if self_server.audit is not None:
+                            self_server.audit.log(
+                                "war-room", "playbook", "add_rule",
+                                {"group": group, "pattern": pattern})
+                        code, body = 200, json.dumps({"added": True}).encode()
+                    except ValueError as exc:
+                        code, body = 400, json.dumps(
+                            {"error": str(exc)}).encode()
+                elif path in ("/api/playbook/promote", "/api/playbook/dismiss"):
+                    from .playbook import dismiss_draft, promote_draft
+                    try:
+                        idx = int(data.get("index", -1))
+                        fn = promote_draft if path.endswith("promote") \
+                            else dismiss_draft
+                        d = fn(self_server.workspace, idx)
+                        if self_server.audit is not None:
+                            self_server.audit.log(
+                                "war-room", "playbook",
+                                "promote_rule" if fn is promote_draft
+                                else "dismiss_rule",
+                                {"pattern": d.get("pattern", "")})
+                        code, body = 200, json.dumps({"ok": True}).encode()
+                    except (ValueError, TypeError) as exc:
+                        code, body = 400, json.dumps(
+                            {"error": str(exc)}).encode()
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))

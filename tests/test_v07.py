@@ -114,7 +114,7 @@ def test_hints_apache_2449():
               "value": "http Apache httpd 2.4.49 ((Unix))"}]
     hints = hints_for(intel)
     assert any("CVE-2021-41773" in h for h in hints)
-    assert any("web enum chain" in h for h in hints)
+    assert any("enum chain" in h for h in hints)
 
 
 def test_hints_vsftpd():

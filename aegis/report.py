@@ -33,12 +33,14 @@ def _mask(value: str) -> str:
 
 class ReportGenerator:
     def __init__(self, db: EngagementDB, engagement: str,
-                 reports_dir: str | Path, include_secrets: bool = False):
+                 reports_dir: str | Path, include_secrets: bool = False,
+                 workspace: str | Path = "."):
         self.db = db
         self.engagement = engagement
         self.reports_dir = Path(reports_dir)
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         self.include_secrets = include_secrets
+        self.workspace = workspace
 
     def build_markdown(self) -> Path:
         targets = self.db.list_targets()
@@ -128,9 +130,15 @@ class ReportGenerator:
             creds = [l for l in loot if l["kind"] == "credential"]
             hashes = [l for l in loot if l["kind"] == "hash"]
             files = [l for l in loot if l["kind"] in ("file", "screenshot")]
+            flags = [l for l in loot if l["kind"] == "flag"]
             L.append(f"- Credentials captured: **{len(creds)}**")
             L.append(f"- Hashes captured: **{len(hashes)}**")
-            L.append(f"- Files/screenshots: **{len(files)}**\n")
+            L.append(f"- Files/screenshots: **{len(files)}**")
+            L.append(f"- Flags captured: **{len(flags)}**\n")
+            for l in flags:
+                host = self.db.get_target(l["target_id"])
+                L.append(f"- 🚩 `{host['host'] if host else '?'}` "
+                         f"{l['title']}: `{l['value']}`")
             for l in creds:
                 host = self.db.get_target(l["target_id"])
                 value = l["value"] if self.include_secrets else _mask(l["value"])
@@ -139,11 +147,55 @@ class ReportGenerator:
         else:
             L.append("_No loot captured._")
 
+        # Engagement knowledge base — what this engagement taught the tool
+        from .playbook import list_custom_rules
+        custom = list_custom_rules(self.workspace)
+        live_rules = ([("version", r[0], r[1])
+                       for r in custom.get("version_hints", [])]
+                      + [("service", r[0], r[1])
+                         for r in custom.get("service_hints", [])]
+                      + [("port", k, v)
+                         for k, v in custom.get("port_hints", {}).items()])
+        drafts = custom.get("drafts", [])
+        if live_rules or drafts:
+            L.append("\n## Engagement Knowledge Base\n")
+            L.append("_Techniques learned or operator-added during this "
+                     "engagement — they make the next engagement against this "
+                     "stack faster._\n")
+            for group, pattern, hint in live_rules:
+                L.append(f"- ✅ **live** ({group}) `{pattern}` — {hint}")
+            for d in drafts:
+                L.append(f"- ⏳ **pending review** ({d['group']}) "
+                         f"`{d['pattern']}` — {d['hint']}")
+
         L.append("\n## Targets Detail\n")
         for t in targets:
             L.append(f"### {t['host']} — {t['status']}")
             if t["description"]:
                 L.append(f"_{t['description']}_\n")
+            # infrastructure profile (deterministically extracted intel)
+            intel = self.db.intel_for(t["id"])
+            if intel:
+                services = [i for i in intel if i["kind"] == "service"]
+                web = [i for i in intel if i["kind"] == "web"]
+                oses = [i for i in intel if i["kind"] == "os"]
+                tech = [i for i in intel if i["kind"] == "tech"]
+                if services:
+                    L.append("**Infrastructure:**\n")
+                    L.append("| Port | Service / version |")
+                    L.append("|---|---|")
+                    for s in services:
+                        L.append(f"| `{s['key']}` | {s['value']} |")
+                    L.append("")
+                if web:
+                    L.append("**Web stack:** " + " · ".join(
+                        f"{i['key']}: `{i['value']}`" for i in web) + "\n")
+                if oses:
+                    L.append("**OS:** " + " · ".join(
+                        f"`{i['value']}`" for i in oses) + "\n")
+                if tech:
+                    L.append("**Technologies:** " + " · ".join(
+                        f"`{i['value']}`" for i in tech) + "\n")
             osint = self.db.osint_for(t["id"])
             if osint:
                 L.append("**OSINT:**\n")
@@ -189,7 +241,30 @@ class ReportGenerator:
     def build_html(self, md_path: Path) -> Path:
         md = md_path.read_text(encoding="utf-8")
         body_lines = []
+        table_buf: list[str] = []
+
+        def flush_table():
+            if not table_buf:
+                return
+            rows = [r for r in table_buf
+                    if not set(r.strip()) <= set("|-: ")]
+            if rows:
+                out = ["<table>"]
+                for ri, r in enumerate(rows):
+                    cells = [c.strip() for c in r.strip().strip("|").split("|")]
+                    tag = "th" if ri == 0 else "td"
+                    out.append("<tr>" + "".join(
+                        f"<{tag}>{html.escape(c)}</{tag}>"
+                        for c in cells) + "</tr>")
+                out.append("</table>")
+                body_lines.append("".join(out))
+            table_buf.clear()
+
         for ln in md.splitlines():
+            if ln.startswith("|"):
+                table_buf.append(ln)
+                continue
+            flush_table()
             esc = html.escape(ln)
             if ln.startswith("### "):
                 body_lines.append(f"<h3>{html.escape(ln[4:])}</h3>")
@@ -201,11 +276,14 @@ class ReportGenerator:
                 body_lines.append(f"<li>{esc[2:]}</li>")
             elif ln.strip():
                 body_lines.append(f"<p>{esc}</p>")
+        flush_table()
         page = f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Report — {html.escape(self.engagement)}</title>
 <style>body{{font-family:system-ui,sans-serif;max-width:960px;margin:2rem auto;
 padding:0 1rem;line-height:1.55}} code{{background:#f0f0f0;padding:0 .3em;
-border-radius:4px}} h1,h2,h3{{color:#12355b}} li{{margin:.15rem 0}}</style>
+border-radius:4px}} h1,h2,h3{{color:#12355b}} li{{margin:.15rem 0}}
+table{{border-collapse:collapse;margin:.5rem 0}} td,th{{border:1px solid #cbd5e1;
+padding:.3rem .7rem;text-align:left;font-size:.9rem}} th{{background:#eef2f7}}</style>
 </head><body>{''.join(body_lines)}</body></html>"""
         out = md_path.with_suffix(".html")
         out.write_text(page, encoding="utf-8")

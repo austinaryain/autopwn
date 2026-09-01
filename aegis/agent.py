@@ -87,7 +87,9 @@ class Agent:
         # deterministic knowledge base: service→attack hints grounded in the
         # intel we extracted, plus wordlists that actually exist on disk
         intel = [dict(i) for i in self.db.intel_for(target_id)]
-        hints = [h.replace("TARGET", target) for h in hints_for(intel)]
+        loot = [dict(l) for l in self.db.loot_for(target_id)]
+        hints = [h.replace("TARGET", target)
+                 for h in hints_for(intel, loot=loot, target=target)]
         hint_text = ""
         if hints:
             hint_text = ("Recommended next steps (knowledge base — these match "
@@ -278,6 +280,20 @@ class Agent:
                                    evaluation.get("summary", ""), success,
                                    evidence=result.output_file or "",
                                    attack_id=attack_id)
+            # learning loop: a proven attack on a known service becomes a
+            # draft KB rule for operator review (never live automatically)
+            if success and mode == "attack":
+                from .playbook import learn_from_success
+                draft = learn_from_success(
+                    self.db, target_id, technique, vector, tool,
+                    result.command, target_row["host"])
+                if draft:
+                    log.warning("learned playbook draft: %s (%s)",
+                                draft["pattern"], technique)
+                    self.runner.audit.log("attack-agent", "playbook",
+                                          "draft_rule",
+                                          {"pattern": draft["pattern"],
+                                           "technique": technique})
             provenance = "tool-proven" if evaluation.get("source") == "parser" \
                 else "model-asserted"
             for f in evaluation.get("findings", []):

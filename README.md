@@ -87,6 +87,66 @@ Two logging layers, two different questions:
 
 First run on Kali: `bash setup_kali.sh` — checks/installs everything, pulls the Ollama model, walks you through scoping `authorization.json`, and gates on the full test suite + simulation validation before declaring readiness.
 
+## v1.1 — reports that show the intelligence
+
+Client deliverables now carry everything the engagement learned:
+
+- **Infrastructure profile per target** — ports/services/versions as a proper table, web stack (server, X-Powered-By/PHP), OS, and detected technologies — all from the deterministic intel extraction, not LLM prose.
+- **Flags in the loot summary** — captured flags are counted and listed in full (credentials stay masked unless `include_secrets`).
+- **Engagement Knowledge Base section** — every live custom playbook rule (✅) and every auto-learned draft awaiting review (⏳) ships in the report, showing clients exactly which techniques were applied and accumulated.
+- **HTML reports render tables properly** — the infrastructure tables now render as real HTML tables instead of raw markdown.
+
+## v1.0 — the learning loop closes itself
+
+**The tool now writes its own playbook from your wins.**
+
+When an *attack* step succeeds against a service with known intel, Aegis
+auto-drafts a KB rule: product+version → the technique and exact command that
+worked (host generalized to `TARGET`). Drafts land in a **review queue** —
+they never go live on their own:
+
+- **War Room**: drafts appear under the KB card with **promote** / **dismiss**
+- **CLI**: `/kb` lists drafts; `/kb promote 0` / `/kb dismiss 0`
+- Promotion runs the same validation as manual rules; everything is
+  audit-logged (`playbook / draft_rule / promote_rule / dismiss_rule`)
+
+Guardrails: only attack-mode successes draft (scans teach nothing); no draft
+when a bundled version-specific rule already covers the service; identical
+drafts dedupe; drafts without service context are skipped. Successful
+*scans* and parser-inconclusive steps never pollute the queue.
+
+The flywheel: run engagement → wins become drafts → you promote the good ones
+→ next engagement against that stack starts smarter. Per-workspace, so each
+client's hard-won knowledge stays with that client.
+
+## v0.9 — living knowledge base (your engagements make it smarter)
+
+The playbook is now **data, not code** — every lesson from every engagement
+becomes permanent capability:
+
+| Feature | Detail |
+|---|---|
+| **JSON knowledge base** | All hint data lives in [aegis/playbook.json](aegis/playbook.json) (20 version-exploit + 21 service + 13 port rules + wordlist maps). Edit it directly — no Python required. |
+| **Per-workspace overlay** | Drop a `playbook.custom.json` in the engagement directory; custom rules are checked **before** bundled ones. Client-specific knowledge (their stack, their quirks) goes here. |
+| **Hot reload** | The KB is re-read on every planning step — add a rule mid-engagement and the agent's very next decision uses it. No restart. |
+| **War Room editing** | "Playbook Knowledge Base" card: pick a group, give a regex/port + hint, done. Validated (bad regex/ports rejected with clear errors), audit-logged, duplicates ignored. |
+| **Per-target recommendations** | The Command Center now shows **what the playbook recommends for this exact target right now** — full transparency into why the agent picks its moves. |
+| **CLI** | `/kb` lists bundled counts + custom rules; `/kb add <group> <pattern> <hint>` adds one from the terminal. |
+
+## v0.8 — engagement-grade knowledge base (labs AND real world)
+
+The playbook grew from CTF-oriented to engagement-grade, covering real-world
+services and bug-bounty methodology. Hints are priority-ordered so the
+planner always sees the highest-value move first:
+
+1. **Version-specific named exploits** — Apache 2.4.49/50, vsftpd 2.3.4, ProFTPD 1.3.5/1.3.3c, Samba usermap + SambaCry, OpenSSH ≤7.6 user-enum, IIS 6.0 WebDAV, Drupalgeddon2, Joomla CVE-2017-8917, Grafana CVE-2021-43798, Heartbleed, Struts2 CVE-2017-5638, UnrealIRCd / distcc / Webmin / Elasticsearch Groovy, Ghostcat (AJP) — each with the exact allowlisted command.
+2. **Service playbooks** — SMB, FTP, SSH, MySQL/MSSQL/PostgreSQL, WordPress, phpMyAdmin, Tomcat/Jenkins, LDAP, SMTP, POP3/IMAP, VNC, RDP, Telnet, NFS, Redis, MongoDB, SNMP, IRC, AJP.
+3. **Port fallbacks** — Docker API (2375), Elasticsearch (9200), Memcached, Kubernetes API/kubelet, Kibana, RabbitMQ, ActiveMQ, Solr, GlassFish, Webmin, Splunkd — for when banners give nothing.
+4. **Bug-bounty web chain** — beyond nikto/gobuster: `/.git/HEAD`, `/.env`, `/.well-known/security.txt`, `/backup.zip`, and a CORS misconfiguration check (reflected origin + credentials = reportable finding).
+5. **Domain recon chain** — when the target is a domain: sublist3r/amass passive enum + vhost fuzzing, with a built-in reminder to verify every discovered subdomain against `authorization.json` before touching it. (Also fixed a guard bug that made `sublist3r -d` unusable.)
+6. **Credential reuse** — the moment any credential lands in loot, the planner is told to stuff it across every discovered login service (the #1 real-world escalation path) and pointed at `/privesc`.
+7. **Version research fallback** — every detected product+version gets a `searchsploit` lookup hint.
+
 ## v0.7 — target intelligence & effectiveness (field feedback, round 3)
 
 Built after Easy/Medium THM targets produced clean runs but empty results:

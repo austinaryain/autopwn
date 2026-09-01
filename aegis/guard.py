@@ -53,7 +53,8 @@ TARGET_FILE_FLAGS_BY_TOOL: dict[str, set[str]] = {
     "rustscan": {"-iL"},
     "nuclei": {"-l", "--list"},
     "amass": {"-df"},
-    "sublist3r": {"-d"},  # domain itself is scope-checked; keep tool runs single-domain
+    # NOTE: sublist3r/theHarvester '-d' is the domain itself (scope-checked
+    # like any other arg) — do NOT list it here or those tools break.
 }
 
 # Flags whose value is an output path; the value must stay inside the workspace.
