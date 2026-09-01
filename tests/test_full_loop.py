@@ -38,6 +38,7 @@ def test_coordinator_mission(tmp_path, monkeypatch):
         shell.agent.llm = scripted
         shell.llm = scripted
         shell.refuter.llm = scripted
+        shell.coordinator.llm = scripted
         shell._target_or_print("10.10.10.5")
         result = shell.coordinator.run_mission("10.10.10.5")
         assert set(result["phases"]) == {"recon", "exploiter", "analyst"}

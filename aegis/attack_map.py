@@ -20,11 +20,11 @@ ATTACK_MAP: dict[str, list[tuple[str, str, tuple[str, ...]]]] = {
         ("T1587.001", "Develop Capabilities: Exploits", ("searchsploit",)),
     ],
     "Initial Access": [
-        ("T1190", "Exploit Public-Facing Application", ("sqlmap", "web-exploit", "exploit-public", "rce", "lfi", "rfi", "upload")),
+        ("T1190", "Exploit Public-Facing Application", ("sqlmap", "web-exploit", "exploit-public", "rce", "lfi", "rfi", "upload", "sqli", "ssti", "xss", "xxe", "ssrf")),
         ("T1078", "Valid Accounts", ("valid-account", "default-creds", "stolen-cred")),
     ],
     "Execution": [
-        ("T1059", "Command and Scripting Interpreter", ("command-injection", "webshell", "revshell", "msfconsole")),
+        ("T1059", "Command and Scripting Interpreter", ("command-injection", "webshell", "revshell", "msfconsole", "cmdi")),
     ],
     "Persistence": [
         ("T1136", "Create Account", ("create-user", "add-user", "persistence")),

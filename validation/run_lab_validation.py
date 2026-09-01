@@ -100,9 +100,9 @@ def run_validation(root: Path, target: str = TARGET, *, real: bool = False,
     cl.check("OSINT items recorded",
              len(shell.db.osint_for(row["id"])) > 0)
 
-    print(f"\n[3/7] Scan agent")
-    scan = shell.agent.run("scan", target)
-    cl.check("scan agent completed steps",
+    print(f"\n[3/7] Scan engine")
+    scan = shell.engine.run("scan", target)
+    cl.check("scan engine completed steps",
              any("command" in e for e in scan["transcript"]))
     attempts = shell.db.attempts_for(row["id"])
     cl.check("scan attempts recorded with ATT&CK tags",
@@ -111,8 +111,8 @@ def run_validation(root: Path, target: str = TARGET, *, real: bool = False,
     cl.check("parser ground truth in memory (open ports)",
              "22/tcp" in memory or "open ports" in memory)
 
-    print(f"\n[4/7] Attack agent")
-    attack = shell.agent.run("attack", target)
+    print(f"\n[4/7] Attack engine")
+    attack = shell.engine.run("attack", target)
     creds = shell.db.credentials()
     cl.check("credential captured by deterministic parser",
              any("admin:S3cur3!" in (c["value"] or "") for c in creds))

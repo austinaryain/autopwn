@@ -13,7 +13,6 @@ distinct briefs and tool subsets, sequenced by the Coordinator:
 
 from __future__ import annotations
 
-from .agent import Agent
 from .db import EngagementDB
 from .provenance import Refuter
 
@@ -59,12 +58,16 @@ Memory:
 
 
 class Coordinator:
-    """Sequences operators over one target, sharing engagement memory."""
+    """Sequences operators over one target, sharing engagement memory.
 
-    def __init__(self, agent: Agent, db: EngagementDB, refuter: Refuter):
-        self.agent = agent
+    Recon and exploitation run on the deterministic capability engine;
+    the analyst phase (refutation + narrative) uses the LLM when available."""
+
+    def __init__(self, engine, db: EngagementDB, refuter: Refuter, llm=None):
+        self.engine = engine
         self.db = db
         self.refuter = refuter
+        self.llm = llm
 
     def run_mission(self, target: str, *, skip_exploit: bool = False,
                     on_step=None, cancel_event=None) -> dict:
@@ -77,18 +80,17 @@ class Coordinator:
             return cb
 
         # Phase 1 — recon
-        result["phases"]["recon"] = self.agent.run(
+        result["phases"]["recon"] = self.engine.run(
             "scan", target, on_step=phase_cb("recon"), cancel_event=cancel_event)
         if cancel_event is not None and cancel_event.is_set():
             self.db.set_target_status(self.db.get_target(target)["id"],
                                       "cancelled")
             result["phases"]["cancelled"] = True
             return result
-        self.agent.llm  # planner briefs are per-mode; recon uses scan brief
 
         # Phase 2 — exploitation (optional, confirmation handled by caller)
         if not skip_exploit:
-            result["phases"]["exploiter"] = self.agent.run(
+            result["phases"]["exploiter"] = self.engine.run(
                 "attack", target, on_step=phase_cb("exploiter"),
                 cancel_event=cancel_event)
 
@@ -96,13 +98,14 @@ class Coordinator:
         row = self.db.get_target(target)
         refutations = self.refuter.review_target(row["id"])
         narrative = ""
-        try:
-            memory = self.db.memory_summary(row["id"])
-            narrative = self.agent.llm.chat(
-                [{"role": "user",
-                  "content": NARRATIVE_PROMPT.format(memory=memory)}])
-        except Exception as exc:
-            narrative = f"(narrative unavailable: {exc})"
+        if self.llm is not None:
+            try:
+                memory = self.db.memory_summary(row["id"])
+                narrative = self.llm.chat(
+                    [{"role": "user",
+                      "content": NARRATIVE_PROMPT.format(memory=memory)}])
+            except Exception as exc:
+                narrative = f"(narrative unavailable: {exc})"
         if narrative:
             self.db.record_loot(row["id"], "note", "attack narrative",
                                 value=narrative[:4000], source="analyst")

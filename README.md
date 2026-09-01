@@ -87,6 +87,97 @@ Two logging layers, two different questions:
 
 First run on Kali: `bash setup_kali.sh` — checks/installs everything, pulls the Ollama model, walks you through scoping `authorization.json`, and gates on the full test suite + simulation validation before declaring readiness.
 
+## v1.5 — injection vuln classes (SQLi · CMDi · SSTI · XSS)
+
+The capability engine now carries four more autonomous web attack classes,
+all following the LFI pattern: **signature-proven, zero LLM judgment.**
+
+- **SQLi** — three independent confirmation strategies, tried in order:
+  error-based (six DB error signatures: MySQL, PostgreSQL, SQLite, Oracle,
+  MSSQL), boolean-blind (TRUE response must equal baseline *and* differ from
+  FALSE — three requests must agree), time-based (injected `SLEEP(3)` /
+  `WAITFOR` measured against a latency baseline, only used as last resort).
+- **Command injection** — `;id`, `|id`, backticks, `$(id)` and Windows
+  `whoami` variants; confirmed only when actual command output
+  (`uid=33(www-data)`) appears in the response. Severity: **critical**, with
+  shell/privesc/container-breakout next steps attached.
+- **SSTI** — unique arithmetic canaries (`{{7331*7}}` → `51317`) across
+  Jinja2/Twig/ERB/FreeMarker syntaxes; confirmed only when the engine
+  *evaluated* the expression (canary value present, raw payload absent).
+- **Reflected XSS** — metacharacter canary; confirmed only on *unescaped*
+  reflection (escaped canaries are not findings).
+
+Every hit is a **verified, tool-proven finding** with the exact payload as
+evidence, a successful attempt in memory, an audit-chain event, ATT&CK
+tagging (T1190 / T1059), and class-specific escalation next steps
+(sqlmap/tplmap/shell guidance). All four are registered engine capabilities
+with `has_web` preconditions — `/attack` tries them automatically on every
+web target, and the engine integration test proves all four are found on a
+multi-vulnerability app with no human direction.
+
+## v1.4 — the capability engine (the agentic core, rebuilt)
+
+The architectural fix: **the agent no longer plans over shell commands — it
+plans over declared capabilities.** Everything Aegis can do to a target is a
+`Capability` with preconditions (a predicate over live engagement state:
+intel, attempt memory, findings, loot), a priority, and an effect. The
+engine loop is deterministic:
+
+```
+observe state → highest-priority untried capability whose preconditions
+are met → execute → results land in the DB → state changes unlock
+follow-ups (a confirmed LFI unlocks source-reading; looted creds unlock
+credential-stuffing) → repeat until nothing applicable remains
+```
+
+- **No LLM required to act.** Hypothesis generation is the precondition
+  graph, grounded in what was actually observed — `/scan`, `/attack`, and
+  `/mission` (recon + exploiter phases) all run on the engine now. The LLM
+  remains for chat/advisory and the analyst's report narrative.
+- **Attempt memory is the anti-repeat mechanism** — a tried capability
+  (success OR failure) is never retried; follow-ups appear only when success
+  changes the state. No more six identical nmap runs.
+- **Secrets never hit argv** — credential replay uses hydra combo files, so
+  passwords can't leak into action logs, output captures, or reports.
+- **Adding a vuln class = registering one Capability.** SQLi, SSTI, XSS —
+  each becomes a precondition + probe, and the agent tries it on every
+  matching target automatically. No new manual command, no per-machine
+  patching.
+- Registered today: TCP/UDP service scan, HTTP headers, whatweb, nuclei,
+  directory brute-force, LFI probe, post-LFI source disclosure, searchsploit
+  version research, default-credential check, credential stuffing — each
+  ATT&CK-tagged via its underlying tool.
+
+The lab validation now drives the engine end-to-end, and the headline test
+points the attack engine at a simulated vulnerable PHP app: it finds the
+LFI, chains to source disclosure, and lands the app's database credential
+in the loot vault — with zero human hints and no LLM.
+
+## v1.3 — deterministic web attack layer (`/lfi`)
+
+The gap that made easy web boxes unsolvable: **no module ever fuzzed
+parameters**. nmap/nuclei/dirb find pages — they never ask "what does
+`?page=` accept?" The new `webattack` module closes that, deterministically:
+
+- `/lfi <url>` discovers parameters from the page itself (links, form inputs)
+  plus 30+ classic names (`page`, `view`, `file`, `cat`, `dog`, …), then probes
+  each with path-traversal payloads (raw, `..%2f`, double-encoded) and
+  `php://filter` source-disclosure wrappers.
+- Detection is **signature-based** (`root:x:0:0:`, `[boot loader]`, decodable
+  base64 PHP source) — a hit is tool-proven ground truth: a *verified* finding
+  with the exact payload as evidence, a successful attempt in memory, and any
+  disclosed source code straight into the loot vault.
+- On success it prints the **escalation path**: source review → log poisoning
+  (User-Agent) → RCE → container breakout checks (`/.dockerenv`,
+  `/proc/1/cgroup`, `docker.sock`) → `/privesc` / `/msf`.
+- The playbook now detects PHP in target intel and surfaces the `/lfi` probe
+  as a recommendation automatically — with the docker-breakout checklist
+  attached.
+
+Probing is done with plain HTTP requests (not the shell runner) so encoded
+payloads survive untouched, but everything still lands in the action log and
+audit chain.
+
 ## v1.2 — one-click playbook recommendations
 
 Every recommendation in the Target Command Center now carries **▶ run**

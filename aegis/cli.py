@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shlex
 from pathlib import Path
+from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.table import Table
@@ -25,6 +26,7 @@ from .postex import PostEx
 from .report import ReportGenerator
 from .runner import Runner, RunnerError
 from .scope import ScopeError, ScopeGate
+from .webattack import WebAttacker
 from .webvuln import WebVulnPipeline
 
 BANNER = r"""
@@ -60,6 +62,7 @@ Commands:
   /kb promote|dismiss <n>     review auto-learned rule drafts
   /map [host]                 MITRE ATT&CK coverage heatmap
   /webvuln <host>             web pipeline: discover HTTP + nuclei scan
+  /lfi <url>                  LFI/RFI probe (param discovery + traversal)
   /privesc <host>             privesc research (searchsploit vs. memory)
   /lateral <host>             find & scope-check lateral movement candidates
   /msf <module> <host>        run a Metasploit exploit via msfrpcd
@@ -107,12 +110,19 @@ class Shell:
         self.webvuln = WebVulnPipeline(self.runner, self.db)
         self.postex = PostEx(self.runner, self.db, self.scope)
         self.msf = MetasploitRPC(config)
-        self.parallel = ParallelRunner(self.agent)
+        from .capabilities import CapabilityEngine
         from .disclosure import DisclosurePipeline
         from .operators import Coordinator
         from .provenance import Refuter
         self.refuter = Refuter(self.llm, self.db)
-        self.coordinator = Coordinator(self.agent, self.db, self.refuter)
+        self.engine = CapabilityEngine(
+            self.runner, self.db, self.audit, self.scope,
+            max_steps=config.get("agent", {}).get("max_steps", 30),
+            time_budget_min=config.get("agent", {})
+            .get("time_budget_minutes", 45))
+        self.parallel = ParallelRunner(self.engine)
+        self.coordinator = Coordinator(self.engine, self.db, self.refuter,
+                                       llm=self.llm)
         self.disclosure = DisclosurePipeline(
             self.db, paths.get("disclosures_dir", "disclosures"))
         self.dashboard: DashboardServer | None = None
@@ -190,13 +200,11 @@ class Shell:
                         "Confirm you are authorized [yes/NO]: ")
             if ans.strip().lower() != "yes":
                 return self.console.print("[yellow]Aborted by operator.[/]")
-        if not self.llm.available():
-            return self.console.print("[red]LLM backend unavailable — start Ollama "
-                                      "or check config.json.[/]")
-        self.console.print(f"[bold magenta]Starting {mode} agent on {host}[/]")
-        result = self.agent.run(mode, host, on_step=self._on_step)
+        self.console.print(f"[bold magenta]Starting {mode} engine on {host}[/] "
+                           "(capability-driven: observe → hypothesize → act)")
+        result = self.engine.run(mode, host, on_step=self._on_step)
         n = len(result["transcript"])
-        self.console.print(f"[green]{mode} agent finished after {n} steps.[/]")
+        self.console.print(f"[green]{mode} engine finished after {n} steps.[/]")
 
     def cmd_run(self, args):
         if not args:
@@ -351,6 +359,37 @@ class Shell:
             for h in r["hits"]:
                 self.console.print(f"  {h}")
 
+    def cmd_lfi(self, args):
+        if not args:
+            return self.console.print("[red]usage: /lfi <url>[/]")
+        url = args[0]
+        if not url.startswith(("http://", "https://")):
+            url = "http://" + url
+        host = urlparse(url).hostname
+        if not host:
+            return self.console.print(f"[red]Cannot parse host from '{url}'[/]")
+        row = self._scoped_target(host)
+        if not row:
+            return
+        attacker = WebAttacker(self.db, audit=self.audit)
+        with self.console.status(f"Probing {url} for LFI (discovering "
+                                 "parameters, traversal payloads)…"):
+            result = attacker.probe_lfi(url, row["id"], host=host)
+        if result.get("error"):
+            return self.console.print(f"[yellow]{result['error']}[/]")
+        if not result["vulnerable"]:
+            return self.console.print(
+                f"[green]No LFI found[/] ({result['probes']} probes). "
+                "If the app uses JS-rendered links, pass a URL with the "
+                "parameter directly: /lfi 'http://host/index.php?page=1'")
+        self.console.print(f"[bold red]LFI CONFIRMED[/] — "
+                           f"param '{result['param']}'")
+        self.console.print(f"  payload : {result['payload']}")
+        self.console.print(f"  evidence: {result['evidence']}")
+        self.console.print(f"  finding #{result['finding_id']} recorded "
+                           "(verified, tool-proven)")
+        self.console.print(f"\n[bold]Next steps:[/] {result['next_steps']}")
+
     def cmd_lateral(self, args):
         if not args:
             return self.console.print("[red]usage: /lateral <host>[/]")
@@ -481,7 +520,7 @@ class Shell:
         if mode == "mission":
             self.coordinator.run_mission(host, cancel_event=cancel_event)
         else:
-            self.agent.run(mode, host, cancel_event=cancel_event)
+            self.engine.run(mode, host, cancel_event=cancel_event)
 
     def cmd_mission(self, args):
         if not args:
@@ -493,8 +532,6 @@ class Shell:
         except ScopeError as exc:
             return self.console.print(f"[red]{exc}[/]")
         self._target_or_print(host)
-        if not self.llm.available():
-            return self.console.print("[red]LLM backend unavailable.[/]")
         if not skip_exploit:
             ans = input(f"Full mission on {host} includes the EXPLOITER phase. "
                         "Confirm written authorization [yes/NO]: ")
@@ -774,6 +811,8 @@ class Shell:
                     self.cmd_map(args)
                 elif cmd == "webvuln":
                     self.cmd_webvuln(args)
+                elif cmd == "lfi":
+                    self.cmd_lfi(args)
                 elif cmd == "privesc":
                     self.cmd_privesc(args)
                 elif cmd == "lateral":

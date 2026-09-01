@@ -287,6 +287,19 @@ def hints_for(intel_items: list[dict], loot: list[dict] | None = None,
                   "a bounty finding")
         web_hints.append(chain)
 
+    # 4b. PHP application → LFI/RFI probe (parameter fuzzing is deterministic)
+    lfi_hints: list[str] = []
+    php_seen = any("php" in i["value"].lower()
+                   for i in intel_items if i["kind"] in ("tech", "web"))
+    if php_seen and web_ports:
+        lfi_hints.append(
+            "PHP application detected → LFI/RFI probe: run /lfi http://TARGET/ "
+            "(auto-discovers ?page= ?view= ?file= ?cat= ?dog= and 30+ classic "
+            "params, tests traversal + php://filter wrappers). On success: "
+            "read source via php://filter, poison logs (User-Agent) for RCE, "
+            "then container breakout checks (/.dockerenv, /proc/1/cgroup, "
+            "mounted docker.sock)")
+
     # 5. domain recon chain (bug bounty) — only for domain targets
     domain_hints: list[str] = []
     if target and DOMAIN_RE.match(target):
@@ -334,7 +347,7 @@ def hints_for(intel_items: list[dict], loot: list[dict] | None = None,
     # assemble in priority order, dedupe, cap
     seen, out = set(), []
     for h in (version_hints + service_hints + port_hints + web_hints +
-              domain_hints + reuse_hints + fallback):
+              lfi_hints + domain_hints + reuse_hints + fallback):
         if h not in seen:
             seen.add(h)
             out.append(h)
