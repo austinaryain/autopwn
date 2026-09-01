@@ -15,6 +15,7 @@ Before ANY tool executes, the guard:
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import time
 from pathlib import Path
@@ -64,6 +65,13 @@ OUTPUT_PATH_FLAGS = {
 # File extensions that indicate wordlists/payloads rather than hostnames.
 FILE_EXT_RE = re.compile(r"\.(txt|lst|json|xml|csv|log|rc|sh|py|gz|tar|zip|"
                          r"png|jpg|html?|md|db|yaml|yml|conf|cfg)$", re.I)
+
+# NSE script categories that are valid selectors without a .nse file.
+NMAP_CATEGORIES = {"auth", "broadcast", "brute", "default", "discovery",
+                   "dos", "exploit", "external", "fuzzer", "intrusive",
+                   "malware", "safe", "version", "vuln"}
+NMAP_SCRIPT_DIRS = ("/usr/share/nmap/scripts",
+                    "/usr/local/share/nmap/scripts")
 
 
 def extract_hosts(args: list[str]) -> list[str]:
@@ -138,6 +146,77 @@ class CommandGuard:
                     raise GuardError(
                         f"Output path '{args[i + 1]}' escapes the workspace — refused.")
 
+    # ---- grounding: arguments must match local reality -------------------
+    @staticmethod
+    def _nmap_script_dir() -> Path | None:
+        for d in NMAP_SCRIPT_DIRS:
+            if Path(d).is_dir():
+                return Path(d)
+        return None
+
+    def check_grounding(self, tool: str, args: list[str]) -> None:
+        """Refuse commands that reference things which do not exist locally:
+        hallucinated NSE script names and made-up file/wordlist paths.
+        Runs only when the reference data is available (no-op off-Kali)."""
+        # 1. nmap --script= names must be real categories or installed .nse
+        if tool == "nmap":
+            script_dir = self._nmap_script_dir()
+            if script_dir is not None:
+                requested: list[str] = []
+                for a in args:
+                    if a.startswith("--script="):
+                        requested.extend(
+                            s.strip() for s in a.split("=", 1)[1].split(",")
+                            if s.strip())
+                if requested:
+                    import difflib
+                    import glob as _glob
+                    installed = {p.stem for p in script_dir.glob("*.nse")}
+                    bad: list[str] = []
+                    for name in requested:
+                        if name in NMAP_CATEGORIES or name in installed:
+                            continue
+                        if any(c in name for c in "*?["):
+                            if _glob.glob(str(script_dir / f"{name}.nse")):
+                                continue
+                        bad.append(name)
+                    if bad:
+                        detail = []
+                        for b in bad:
+                            close = difflib.get_close_matches(
+                                b, sorted(installed), n=3, cutoff=0.55)
+                            detail.append(
+                                f"'{b}'" + (f" (did you mean: {', '.join(close)}?)"
+                                            if close else " (nothing similar)"))
+                        raise GuardError(
+                            "Unknown NSE script(s): " + "; ".join(detail) +
+                            f". Only use scripts installed in {script_dir}.")
+
+        # 2. filesystem paths in arguments must exist (wordlists etc.)
+        skip_next = False
+        for arg in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg in OUTPUT_PATH_FLAGS:
+                skip_next = True   # output destinations are created, not read
+                continue
+            if URL_RE.match(arg):
+                continue
+            if not arg.startswith(("/", "~/", "./", "../")):
+                continue
+            p = Path(os.path.expanduser(arg))
+            if not p.is_absolute():
+                p = self.workspace / p
+            if not p.exists():
+                from .playbook import available_wordlists
+                wls = available_wordlists()
+                hint = (" Wordlists that DO exist: " + "; ".join(
+                    f"{k}={v}" for k, v in wls.items())) if wls else ""
+                raise GuardError(
+                    f"Path '{arg}' does not exist on this machine — refusing "
+                    f"to run a command built on a made-up file path.{hint}")
+
     # ---- embedded host scope ---------------------------------------------
     def check_embedded_hosts(self, args: list[str]) -> list[str]:
         hosts = extract_hosts(args)
@@ -194,6 +273,7 @@ class CommandGuard:
     def validate(self, tool: str, args: list[str], technique: str = "") -> list[str]:
         """Run all checks; returns the list of embedded hosts that passed."""
         self.check_flags(tool, args)
+        self.check_grounding(tool, args)
         hosts = self.check_embedded_hosts(args)
         self.check_roe(tool, args, technique)
         self.rate_limit()

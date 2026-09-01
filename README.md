@@ -87,6 +87,19 @@ Two logging layers, two different questions:
 
 First run on Kali: `bash setup_kali.sh` — checks/installs everything, pulls the Ollama model, walks you through scoping `authorization.json`, and gates on the full test suite + simulation validation before declaring readiness.
 
+## v0.7 — target intelligence & effectiveness (field feedback, round 3)
+
+Built after Easy/Medium THM targets produced clean runs but empty results:
+
+| Feature | Detail |
+|---|---|
+| **Target intel extraction** | Every captured output is deterministically mined: open ports + service versions (nmap), `Server:`/`X-Powered-By:` headers (curl/nikto/nmap), whatweb tech plugins, OS guesses → deduped `intel` table. Answers "what PHP/Apache version is running?" without digging through logs. |
+| **Flag & secret hunter** | Every output is scanned for `THM{…}`, `HTB{…}`, `flag{…}`, context-aware 32-hex flags, and private keys → auto-recorded as loot + audit entry, even if the LLM misses them. |
+| **Command Center** | Click any target in the War Room: infrastructure table (ports/versions), web stack chips (server, PHP, OS), findings, loot with reveal, attempts, and every action with its error reason and a **[log]** button that opens the full captured output. Auto-refreshes during runs. |
+| **Playbook hints** | A deterministic service→attack knowledge base (Apache 2.4.49 → CVE-2021-41773 with the exact curl, vsftpd 2.3.4 → backdoor, SMB → enum4linux chain, HTTP → whatweb/robots/nikto/gobuster chain, …) is injected into the planner prompt, grounded in what was actually found. |
+| **Command grounding** | The guard now refuses hallucinated arguments *before execution*: unknown NSE script names are checked against `/usr/share/nmap/scripts` with did-you-mean suggestions, and nonexistent file/wordlist paths (e.g. `/path/to/custom/wordlist`) are refused with a list of wordlists that actually exist. |
+| **Adapt, don't die** | Guard refusals are recorded with their reason, fed back into planner memory, and the agent continues with a corrected command — only scope violations stop the loop. |
+
 ## v0.6 — diagnosability (field feedback, round 2)
 
 | Feature | Detail |

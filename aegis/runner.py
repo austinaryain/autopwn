@@ -48,6 +48,7 @@ class RunResult:
         self.output_file = output_file
         self.stdout_tail = stdout_tail
         self.status = status  # "ok" | "error" | "timeout" | "refused"
+        self.refusal = None   # "guard" | "scope" when status == "refused"
 
     def __repr__(self):
         return (f"<RunResult {self.status} exit={self.exit_code} "
@@ -120,8 +121,13 @@ class Runner:
                 log.warning("guard refused %s %s: %s", tool, args, exc)
                 self.audit.log(agent, "guard", "command_refused",
                                {"tool": tool, "args": args, "reason": str(exc)})
-                return RunResult(None, f"{tool} {' '.join(args)}", -1, 0.0, None,
-                                 "", "refused")
+                cmd_str = f"{tool} {' '.join(str(a) for a in args)}"
+                action_id = self.db.record_action(
+                    target_id, agent, tool, cmd_str, -1, 0.0, None, "refused",
+                    error=f"guard refused: {exc}")
+                res = RunResult(action_id, cmd_str, -1, 0.0, None, "", "refused")
+                res.refusal = "guard"
+                return res
 
         # 3. scope gate
         if target_host:
@@ -131,8 +137,13 @@ class Runner:
                 log.warning("scope refused %s: %s", target_host, exc)
                 self.audit.log(agent, "scope", "out_of_scope_refused",
                                {"host": target_host, "tool": tool, "error": str(exc)})
-                return RunResult(None, f"{tool} {' '.join(args)}", -1, 0.0, None,
-                                 "", "refused")
+                cmd_str = f"{tool} {' '.join(str(a) for a in args)}"
+                action_id = self.db.record_action(
+                    target_id, agent, tool, cmd_str, -1, 0.0, None, "refused",
+                    error=f"out of scope: {exc}")
+                res = RunResult(action_id, cmd_str, -1, 0.0, None, "", "refused")
+                res.refusal = "scope"
+                return res
 
         # 4. tool must exist before we go further
         resolved = shutil.which(tool)
@@ -238,6 +249,23 @@ class Runner:
                        {"action_id": action_id, "command": cmd_str,
                         "exit_code": exit_code, "duration_sec": round(duration, 2),
                         "status": status, "output_file": str(output_file)})
+
+        # 7. deterministic post-processing: mine every byte we captured.
+        #    Flags/secrets become loot; services/versions/web stack become
+        #    structured intel that feeds the dashboard, planner and playbook.
+        if target_id is not None and out and status != "refused":
+            from .intel import extract_intel, hunt_flags
+            for f in hunt_flags(out):
+                self.db.record_loot(target_id, f["kind"], f["title"],
+                                    value=f["value"], source=cmd_str[:200])
+                self.audit.log(agent, "loot", "auto_capture",
+                               {"kind": f["kind"], "title": f["title"],
+                                "action_id": action_id})
+                log.warning("AUTO-CAPTURED %s via %s: %s",
+                            f["kind"], tool, f["value"][:80])
+            for item in extract_intel(tool, cmd_str, out):
+                self.db.record_intel(target_id, item["kind"], item["key"],
+                                     item["value"], source=cmd_str)
 
         tail = "\n".join(out.strip().splitlines()[-40:])
         return RunResult(action_id, cmd_str, exit_code, duration,

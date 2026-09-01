@@ -80,14 +80,30 @@ class Agent:
 
     def _plan(self, brief: str, target: str, target_id: int) -> dict:
         from .attack_map import coverage, planner_gap_hint
+        from .playbook import available_wordlists, hints_for
         memory = self.db.memory_summary(target_id)
         gap_hint = planner_gap_hint(coverage(self.db, target_id))
         tools = ", ".join(sorted(self.runner.allowed_tools))
+        # deterministic knowledge base: service→attack hints grounded in the
+        # intel we extracted, plus wordlists that actually exist on disk
+        intel = [dict(i) for i in self.db.intel_for(target_id)]
+        hints = [h.replace("TARGET", target) for h in hints_for(intel)]
+        hint_text = ""
+        if hints:
+            hint_text = ("Recommended next steps (knowledge base — these match "
+                         "what was actually found on the target):\n"
+                         + "\n".join(f"- {h}" for h in hints) + "\n\n")
+        wls = available_wordlists()
+        if wls:
+            hint_text += ("Files that exist on this machine — use these exact "
+                          "paths, never invent others:\n"
+                          + "\n".join(f"- {k}: {v}" for k, v in wls.items())
+                          + "\n\n")
         messages = [
             {"role": "system", "content": SYSTEM.format(tools=tools)},
             {"role": "user", "content":
                 f"{brief}\n\nTarget: {target}\n\n{gap_hint}\n\n"
-                f"Memory so far:\n{memory}"},
+                f"{hint_text}Memory so far:\n{memory}"},
         ]
         raw = self.llm.chat(messages, json_mode=True)
         return self._parse_json(raw)
@@ -236,6 +252,20 @@ class Agent:
                     on_step({**event, "phase": "error"})
                 continue
 
+            if result.status == "refused":
+                # refusal reason is already in memory (actions.error) — the
+                # planner will read it next step and adapt.
+                event.update({"phase": "refused", "status": "refused",
+                              "success": False,
+                              "evaluation": f"refused ({result.refusal}): "
+                                            "reason recorded in memory"})
+                transcript.append(event)
+                if on_step:
+                    on_step(event)
+                if result.refusal == "scope":
+                    break  # scope refusal — stop, do not fight the gate
+                continue  # guard/grounding refusal — adapt, don't die
+
             evaluation = self._assess(tool, result.command,
                                       self._full_output(result))
             log.debug("step %s %s: status=%s source=%s success=%s",
@@ -274,9 +304,6 @@ class Agent:
             transcript.append(event)
             if on_step:
                 on_step(event)
-
-            if result.status == "refused":
-                break  # scope refusal — stop, do not fight the gate
 
         self.db.set_target_status(target_id, f"{mode}-done")
         return {"target": target_row["host"], "mode": mode, "transcript": transcript}

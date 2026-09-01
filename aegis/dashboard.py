@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from .attack_map import coverage
 from .db import EngagementDB
@@ -29,6 +30,11 @@ td,th{padding:.25rem .5rem;text-align:left;border-bottom:1px solid #22314a}
 .sev-low{color:#6fd3ff}.sev-info{color:#9fb3c8}
 .ok{color:#5aff8a}.fail{color:#ff7a7a}.mono{font-family:ui-monospace,monospace;
 font-size:.75rem;color:#9fb3c8}
+a{color:#5aa0ff;text-decoration:none} a:hover{text-decoration:underline}
+pre{white-space:pre-wrap;background:#0b111c;border:1px solid #22314a;
+border-radius:6px;padding:.6rem;max-height:26rem;overflow:auto}
+.chip{display:inline-block;background:#0b111c;border:1px solid #22314a;
+border-radius:4px;padding:.05rem .45rem;margin:.12rem;font-size:.72rem}
 </style></head><body>
 <h1>🛡 Aegis Workbench — live engagement</h1>
 <div class="grid">
@@ -52,6 +58,10 @@ font-size:.75rem;color:#9fb3c8}
 <div class="mono">Adds to authorization.json (audited) and registers the target.</div></div>
 <div class="card" style="margin-top:1.2rem"><h2>Recent activity</h2>
 <div id="actions"></div></div>
+<div class="card" style="margin-top:1.2rem"><h2>Target Command Center</h2>
+<div id="detail" class="mono">click a target above to explore everything known about it</div></div>
+<div class="card" style="margin-top:1.2rem"><h2>Action log</h2>
+<pre id="logview">press [log] on any action in the command center</pre></div>
 <script>
 const TOK = new URLSearchParams(location.search).get('token');
 const REVEALED = {};  // loot id -> revealed value; survives the 3s refresh
@@ -85,10 +95,68 @@ async function revealLoot(id){
   } catch(e) { REVEALED[id] = '⚠ reveal failed: '+e; }
   refresh();
 }
+function lootLine(l){
+  const shown = REVEALED[l.id] !== undefined ? REVEALED[l.id] : (l.value||'');
+  const link = REVEALED[l.id] !== undefined ? '' :
+    ` <a href="#" onclick="revealLoot(${l.id});return false"
+       style="font-size:.75rem">reveal</a>`;
+  return `<div>(${esc(l.kind)}) ${esc(l.title)} <span class="mono">${esc(shown)}</span>${link}</div>`;
+}
+// ---- Target Command Center --------------------------------------------------
+let SEL = null;
+async function selectTarget(id){ SEL = id; await loadDetail(); }
+async function loadDetail(){
+  if (SEL == null) return;
+  try {
+    const d = await (await fetch('/api/target?id='+SEL+'&token='+TOK)).json();
+    if (d.error){ document.getElementById('detail').textContent = d.error; return; }
+    renderDetail(d);
+  } catch(e){ /* transient — next refresh retries */ }
+}
+async function showLog(id){
+  const r = await fetch('/api/action/log?id='+id+'&token='+TOK);
+  document.getElementById('logview').textContent = await r.text();
+  document.getElementById('logview').scrollIntoView({behavior:'smooth'});
+}
+function renderDetail(d){
+  const t = d.target;
+  const svc  = d.intel.filter(i=>i.kind==='service');
+  const web  = d.intel.filter(i=>i.kind==='web');
+  const os   = d.intel.filter(i=>i.kind==='os');
+  const tech = d.intel.filter(i=>i.kind==='tech');
+  let h = `<div><b style="font-size:1.05rem">${esc(t.host)}</b>
+    <span class="mono">${esc(t.status)}</span>
+    <span class="mono">${esc(t.description||'')}</span></div>`;
+  h += '<h2>Infrastructure</h2>';
+  h += svc.length
+    ? '<table><tr><th>port</th><th>service / version</th></tr>' +
+      svc.map(s=>`<tr><td>${esc(s.key)}</td><td>${esc(s.value)}</td></tr>`).join('') +
+      '</table>'
+    : '<div class="mono">no services identified yet</div>';
+  h += web.map(w=>`<span class="chip">🌐 ${esc(w.key)}: ${esc(w.value)}</span>`).join('');
+  h += os.map(w=>`<span class="chip">🖥 ${esc(w.value)}</span>`).join('');
+  h += tech.map(w=>`<span class="chip">⚙ ${esc(w.value)}</span>`).join('');
+  h += '<h2>Findings</h2>' + (d.findings.map(f=>
+    `<div class="sev-${f.severity}">[${f.severity.toUpperCase()}] ${esc(f.title)}</div>`
+    ).join('') || '<div class="mono">none</div>');
+  h += '<h2>Loot</h2>' + (d.loot.map(lootLine).join('') || '<div class="mono">none</div>');
+  h += '<h2>Attempts</h2>' + (d.attempts.map(a=>
+    `<div class="mono"><span class="${a.success?'ok':'fail'}">${a.success?'✔':'✘'}</span> `+
+    `${esc(a.technique)}${a.vector?' via '+esc(a.vector):''} — ${esc((a.result||'').slice(0,140))}</div>`
+    ).join('') || '<div class="mono">none</div>');
+  h += '<h2>Actions</h2>' + (d.actions.map(a=>
+    `<div class="mono">[${a.ts}] ${esc(a.command)} —
+     <span class="${a.exit_code==0?'ok':'fail'}">${a.status}${a.exit_code?' (exit '+a.exit_code+')':''}</span>
+     <a href="#" onclick="showLog(${a.id});return false" style="font-size:.72rem">log</a></div>` +
+    (a.error ? `<div class="fail mono" style="white-space:pre-wrap;margin:0 0 .4rem 1rem">${esc(a.error)}</div>` : '')
+    ).join('') || '<div class="mono">none</div>');
+  document.getElementById('detail').innerHTML = h;
+}
 async function refresh(){
   const s = await (await fetch('/api/state?token='+TOK)).json();
   document.getElementById('targets').innerHTML = s.targets.map(t =>
-    `<div><b>${esc(t.host)}</b> <span class="mono">${esc(t.status)}</span></div>`).join('') || 'none';
+    `<div><b><a href="#" onclick="selectTarget(${t.id});return false">${esc(t.host)}</a></b>
+     <span class="mono">${esc(t.status)}</span></div>`).join('') || 'none';
   document.getElementById('attack').innerHTML =
     '<table>' + s.attack.map(a =>
       `<tr><td>${esc(a.tactic)}</td><td>${a.tried}</td><td class="ok">${a.succeeded}</td></tr>`
@@ -96,13 +164,7 @@ async function refresh(){
   document.getElementById('findings').innerHTML = s.findings.map(f =>
     `<div class="sev-${f.severity}">[${f.severity.toUpperCase()}] ${esc(f.title)}
      <span class="mono">${esc(f.host||'')}</span></div>`).join('') || 'none yet';
-  document.getElementById('loot').innerHTML = s.loot.map(l => {
-    const shown = REVEALED[l.id] !== undefined ? REVEALED[l.id] : (l.value||'');
-    const link = REVEALED[l.id] !== undefined ? '' :
-      ` <a href="#" onclick="revealLoot(${l.id});return false"
-         style="color:#5aa0ff;font-size:.75rem">reveal</a>`;
-    return `<div>(${esc(l.kind)}) ${esc(l.title)} <span class="mono">${esc(shown)}</span>${link}</div>`;
-  }).join('') || 'none yet';
+  document.getElementById('loot').innerHTML = s.loot.map(lootLine).join('') || 'none yet';
   document.getElementById('actions').innerHTML = s.actions.map(a =>
     `<div class="mono">[${a.ts}] <b>${esc(a.agent)}</b> ${esc(a.command)}
      — <span class="${a.exit_code==0?'ok':'fail'}">${a.status}${
@@ -115,6 +177,7 @@ async function refresh(){
        ` <a href="#" onclick="stopMission(${id});return false"
           style="color:#ff5a5a">■ stop</a>` : '') + `</div>`)
     .join('') || 'no missions yet';
+  if (SEL != null) loadDetail();
 }
 refresh(); setInterval(refresh, 3000);
 </script></body></html>"""
@@ -213,6 +276,42 @@ class DashboardServer:
         return {"targets": targets, "actions": actions, "findings": findings,
                 "loot": loot, "attack": attack, "missions": missions}
 
+    def _target_detail(self, target_id: int) -> dict:
+        """Everything known about one target — the command center payload."""
+        t = self.db.get_target(target_id)
+        if not t:
+            return {"error": "target not found"}
+        intel = [dict(r) for r in self.db.intel_for(target_id)]
+        findings = [dict(f) for f in self.db.findings_for(target_id)]
+        loot = []
+        for r in self.db.loot_for(target_id):
+            row = dict(r)
+            if row["kind"] in ("credential", "hash"):
+                v = row.get("value") or ""
+                row["value"] = "••••••" + v[-4:] if len(v) >= 4 else "••••••"
+            loot.append(row)
+        attempts = [dict(r) for r in self.db.attempts_for(target_id)]
+        actions = [dict(r) for r in self.db.conn.execute(
+            "SELECT id, ts, agent, command, exit_code, status, error"
+            " FROM actions WHERE target_id = ? ORDER BY id DESC LIMIT 50",
+            (target_id,)).fetchall()]
+        return {"target": dict(t), "intel": intel, "findings": findings,
+                "loot": loot, "attempts": attempts, "actions": actions}
+
+    def _action_log(self, action_id: int) -> str:
+        row = self.db.conn.execute(
+            "SELECT output_file FROM actions WHERE id = ?",
+            (action_id,)).fetchone()
+        if not row:
+            return "(no such action)"
+        if not row["output_file"]:
+            return "(no captured output — refused actions have no log)"
+        try:
+            return Path(row["output_file"]).read_text(
+                encoding="utf-8", errors="replace")[-200_000:]
+        except OSError as exc:
+            return f"(could not read output file: {exc})"
+
     def start(self) -> str:
         page = PAGE
         self_server = self
@@ -248,6 +347,25 @@ class DashboardServer:
                     except (ValueError, TypeError) as exc:
                         body = json.dumps({"error": f"bad request: {exc}"}).encode()
                     ctype = "application/json"
+                elif path == "/api/target":
+                    from urllib.parse import urlparse, parse_qs
+                    try:
+                        q = parse_qs(urlparse(self.path).query)
+                        tid = int(q.get("id", ["0"])[0])
+                        body = json.dumps(
+                            self_server._target_detail(tid)).encode()
+                    except (ValueError, TypeError) as exc:
+                        body = json.dumps({"error": f"bad request: {exc}"}).encode()
+                    ctype = "application/json"
+                elif path == "/api/action/log":
+                    from urllib.parse import urlparse, parse_qs
+                    try:
+                        q = parse_qs(urlparse(self.path).query)
+                        aid = int(q.get("id", ["0"])[0])
+                        body = self_server._action_log(aid).encode()
+                    except (ValueError, TypeError) as exc:
+                        body = f"(bad request: {exc})".encode()
+                    ctype = "text/plain; charset=utf-8"
                 else:
                     body = page.encode()
                     ctype = "text/html"

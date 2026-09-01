@@ -76,11 +76,23 @@ CREATE TABLE IF NOT EXISTS loot (
     source TEXT DEFAULT '',        -- which action/attempt produced it
     FOREIGN KEY (target_id) REFERENCES targets(id)
 );
+CREATE TABLE IF NOT EXISTS intel (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT DEFAULT (datetime('now')),
+    target_id INTEGER,
+    kind TEXT,            -- service | web | os | tech
+    key TEXT,             -- e.g. "80/tcp", "server", "x-powered-by"
+    value TEXT,
+    source TEXT DEFAULT '',        -- tool/command that revealed it
+    UNIQUE (target_id, kind, key, value),
+    FOREIGN KEY (target_id) REFERENCES targets(id)
+);
 CREATE INDEX IF NOT EXISTS idx_actions_target ON actions(target_id);
 CREATE INDEX IF NOT EXISTS idx_attempts_target ON attempts(target_id);
 CREATE INDEX IF NOT EXISTS idx_findings_target ON findings(target_id);
 CREATE INDEX IF NOT EXISTS idx_osint_target ON osint(target_id);
 CREATE INDEX IF NOT EXISTS idx_loot_target ON loot(target_id);
+CREATE INDEX IF NOT EXISTS idx_intel_target ON intel(target_id);
 """
 
 # Columns added after v0.1 — applied idempotently to existing databases.
@@ -255,6 +267,21 @@ class EngagementDB:
         ).fetchall()
         return [self._decrypt_row(r) for r in rows]
 
+    # ---- intel (structured target profile) -------------------------------
+    def record_intel(self, target_id, kind, key, value, source="") -> int | None:
+        """Idempotent: UNIQUE(target_id, kind, key, value) dedupes."""
+        cur = self._execute(
+            "INSERT OR IGNORE INTO intel(target_id, kind, key, value, source)"
+            " VALUES (?,?,?,?,?)",
+            (target_id, kind, key, value, source[:200]),
+        )
+        return cur.lastrowid if cur.rowcount else None
+
+    def intel_for(self, target_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM intel WHERE target_id = ? ORDER BY kind, key",
+            (target_id,)).fetchall()
+
     def findings_for(self, target_id: int | None = None) -> list[sqlite3.Row]:
         if target_id is None:
             return self.conn.execute("SELECT * FROM findings ORDER BY id").fetchall()
@@ -281,6 +308,11 @@ class EngagementDB:
     def memory_summary(self, target_id: int) -> str:
         """Compact text digest of everything known about a target — fed to the LLM."""
         lines: list[str] = []
+        intel = self.intel_for(target_id)
+        if intel:
+            lines.append("## Target profile (extracted from tool output — trust this)")
+            for i in intel[:25]:
+                lines.append(f"- [{i['kind']}] {i['key']}: {i['value']}")
         actions = self.conn.execute(
             "SELECT tool, command, exit_code, status, error FROM actions"
             " WHERE target_id = ? ORDER BY id DESC LIMIT 30", (target_id,)
