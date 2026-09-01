@@ -44,6 +44,26 @@ class ScopeGate:
             raise ScopeError("authorization.json has an empty scope.")
         self._check_window()
 
+    def add_to_scope(self, entry: str) -> None:
+        """Add a host/CIDR to authorization.json and reload in-memory scope.
+
+        This edits the operator's own scope document at the operator's
+        explicit request (dashboard/CLI). Every change is audit-logged by
+        the caller; the file write is atomic (write tmp + replace).
+        """
+        entry = entry.strip()
+        if not entry:
+            raise ScopeError("empty scope entry")
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        scope_list = data.setdefault("scope", [])
+        if entry not in scope_list:
+            scope_list.append(entry)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            tmp.replace(self.path)
+        if entry not in self.scope:
+            self.scope.append(entry)
+
     def _check_window(self) -> None:
         today = time.strftime("%Y-%m-%d")
         if not (self.valid_from <= today <= self.valid_until):

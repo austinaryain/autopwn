@@ -43,6 +43,13 @@ font-size:.75rem;color:#9fb3c8}
 <select id="mmode"><option>scan</option><option>attack</option><option>mission</option></select>
 <button type="submit">Launch</button></form>
 <div id="missions" class="mono"></div></div>
+<div class="card" style="margin-top:1.2rem"><h2>Add to Scope</h2>
+<form onsubmit="addScope(event)">
+<input id="shost" placeholder="IP / host / CIDR" required>
+<input id="snetwork" placeholder="network / room label (e.g. THM-Attacks)">
+<button type="submit">Authorize</button></form>
+<div id="scopemsg" class="mono"></div>
+<div class="mono">Adds to authorization.json (audited) and registers the target.</div></div>
 <div class="card" style="margin-top:1.2rem"><h2>Recent activity</h2>
 <div id="actions"></div></div>
 <script>
@@ -52,6 +59,24 @@ async function launch(e){
   await fetch('/api/mission/start?token='+TOK, {method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({host: mhost.value, mode: mmode.value})});
+}
+async function addScope(e){
+  e.preventDefault();
+  const r = await fetch('/api/scope/add?token='+TOK, {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({host: shost.value, network: snetwork.value})});
+  const j = await r.json();
+  document.getElementById('scopemsg').textContent =
+    j.added ? '✔ authorized: '+shost.value : '✘ '+(j.error||'failed');
+}
+async function stopMission(id){
+  await fetch('/api/mission/stop?token='+TOK, {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})});
+}
+async function revealLoot(id, el){
+  const r = await fetch('/api/loot?id='+id+'&reveal=1&token='+TOK);
+  const j = await r.json();
+  el.outerHTML = '<span class="mono">'+(j.value||j.file_path||'')+'</span>';
 }
 async function refresh(){
   const s = await (await fetch('/api/state?token='+TOK)).json();
@@ -65,14 +90,19 @@ async function refresh(){
     `<div class="sev-${f.severity}">[${f.severity.toUpperCase()}] ${f.title}
      <span class="mono">${f.host||''}</span></div>`).join('') || 'none yet';
   document.getElementById('loot').innerHTML = s.loot.map(l =>
-    `<div>(${l.kind}) ${l.title} <span class="mono">${l.value}</span></div>`
+    `<div>(${l.kind}) ${l.title} <span class="mono">${l.value}</span>
+     <a href="#" onclick="revealLoot(${l.id},this);return false"
+        style="color:#5aa0ff;font-size:.75rem">reveal</a></div>`
     ).join('') || 'none yet';
   document.getElementById('actions').innerHTML = s.actions.map(a =>
     `<div class="mono">[${a.ts}] <b>${a.agent}</b> ${a.command}
      — <span class="${a.exit_code==0?'ok':'fail'}">${a.status}</span></div>`
     ).join('') || 'none yet';
   document.getElementById('missions').innerHTML = Object.entries(s.missions||{})
-    .map(([id,m]) => `<div>mission ${id}: <b>${m.mode}</b> ${m.host} — ${m.status}</div>`)
+    .map(([id,m]) => `<div>mission ${id}: <b>${m.mode}</b> ${m.host} — ${m.status}` +
+      (m.status==='running' ?
+       ` <a href="#" onclick="stopMission(${id});return false"
+          style="color:#ff5a5a">■ stop</a>` : '') + `</div>`)
     .join('') || 'no missions yet';
 }
 refresh(); setInterval(refresh, 3000);
@@ -89,26 +119,56 @@ class DashboardServer:
         self.token = secrets.token_urlsafe(24)  # per-session bearer token
         self.missions: dict[int, dict] = {}
         self._mission_counter = 0
-        self.mission_handler = None  # callable(host, mode, on_event) set by shell
+        self.mission_handler = None  # callable(host, mode, cancel_event)
+        self.scope_handler = None    # callable(host, network) — set by shell
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+
+    def _loot_item(self, loot_id: int, reveal: bool) -> dict:
+        row = self.db.conn.execute("SELECT * FROM loot WHERE id = ?",
+                                   (loot_id,)).fetchone()
+        if not row:
+            return {"error": "not found"}
+        decrypted = self.db._decrypt_row(row)
+        value = decrypted["value"] or ""
+        if not reveal and decrypted["kind"] in ("credential", "hash"):
+            value = "••••••" + value[-4:] if len(value) >= 4 else "••••••"
+        return {"id": row["id"], "kind": row["kind"], "title": row["title"],
+                "value": value, "file_path": row["file_path"],
+                "revealed": reveal}
 
     def launch_mission(self, host: str, mode: str) -> int:
         if self.mission_handler is None:
             raise RuntimeError("no mission handler wired")
         self._mission_counter += 1
         mid = self._mission_counter
+        cancel = threading.Event()
         self.missions[mid] = {"host": host, "mode": mode, "status": "running"}
 
         def work():
             try:
-                self.mission_handler(host, mode)
-                self.missions[mid]["status"] = "complete"
+                self.mission_handler(host, mode, cancel)
+                if cancel.is_set():
+                    self.missions[mid]["status"] = "stopped by operator"
+                else:
+                    self.missions[mid]["status"] = "complete"
             except Exception as exc:
                 self.missions[mid]["status"] = f"error: {exc}"
 
         threading.Thread(target=work, daemon=True).start()
+        self.missions[mid]["_cancel"] = cancel
         return mid
+
+    def stop_mission(self, mid: int) -> bool:
+        m = self.missions.get(mid)
+        if not m or m["status"] != "running":
+            return False
+        cancel = m.get("_cancel")
+        if cancel is not None:
+            cancel.set()
+            m["status"] = "stopping…"
+            return True
+        return False
 
     def _state(self) -> dict:
         conn = self.db.conn
@@ -133,8 +193,11 @@ class DashboardServer:
         attack = [{"tactic": t, "tried": len(c["tried"]),
                    "succeeded": len(c["succeeded"])}
                   for t, c in cov.items() if c["tried"]]
+        missions = {str(k): {kk: vv for kk, vv in v.items()
+                             if not kk.startswith("_")}
+                    for k, v in self.missions.items()}
         return {"targets": targets, "actions": actions, "findings": findings,
-                "loot": loot, "attack": attack, "missions": self.missions}
+                "loot": loot, "attack": attack, "missions": missions}
 
     def start(self) -> str:
         page = PAGE
@@ -160,6 +223,14 @@ class DashboardServer:
                 if path == "/api/state":
                     body = json.dumps(self_server._state()).encode()
                     ctype = "application/json"
+                elif path == "/api/loot":
+                    from urllib.parse import urlparse, parse_qs
+                    q = parse_qs(urlparse(self.path).query)
+                    loot_id = int(q.get("id", ["0"])[0])
+                    reveal = q.get("reveal", ["0"])[0] == "1"
+                    body = json.dumps(
+                        self_server._loot_item(loot_id, reveal)).encode()
+                    ctype = "application/json"
                 else:
                     body = page.encode()
                     ctype = "text/html"
@@ -176,25 +247,37 @@ class DashboardServer:
                     self.end_headers()
                     return
                 path = urlparse(self.path).path
+                length = int(self.headers.get("Content-Length", 0))
+                data = json.loads(self.rfile.read(length) or b"{}")
+                code, body = 404, json.dumps({"error": "unknown route"}).encode()
                 if path == "/api/mission/start":
-                    length = int(self.headers.get("Content-Length", 0))
-                    data = json.loads(self.rfile.read(length) or b"{}")
                     try:
                         mid = self_server.launch_mission(
                             str(data.get("host", "")), str(data.get("mode", "scan")))
-                        body = json.dumps({"mission_id": mid}).encode()
-                        code = 200
+                        code, body = 200, json.dumps({"mission_id": mid}).encode()
                     except Exception as exc:
-                        body = json.dumps({"error": str(exc)}).encode()
-                        code = 400
-                    self.send_response(code)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                else:
-                    self.send_response(404)
-                    self.end_headers()
+                        code, body = 400, json.dumps({"error": str(exc)}).encode()
+                elif path == "/api/mission/stop":
+                    ok = self_server.stop_mission(int(data.get("id", 0)))
+                    code = 200 if ok else 400
+                    body = json.dumps({"stopped": ok}).encode()
+                elif path == "/api/scope/add":
+                    if self_server.scope_handler is None:
+                        code, body = 400, json.dumps(
+                            {"error": "no scope handler wired"}).encode()
+                    else:
+                        try:
+                            self_server.scope_handler(str(data.get("host", "")),
+                                                      str(data.get("network", "")))
+                            code, body = 200, json.dumps({"added": True}).encode()
+                        except Exception as exc:
+                            code, body = 400, json.dumps(
+                                {"error": str(exc)}).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
             def log_message(self, *args):  # silence
                 pass

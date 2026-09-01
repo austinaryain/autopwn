@@ -72,6 +72,22 @@ class Runner:
         self.scope = scope
         self.opsec = None  # optional OpsecProfile, set by the shell
         self.guard = None  # optional CommandGuard, set by the shell
+        import threading
+        self._active_lock = threading.Lock()
+        self.active_procs: dict[int, subprocess.Popen] = {}
+
+    def cancel_all(self) -> int:
+        """Kill every running tool process. Returns count killed."""
+        with self._active_lock:
+            procs = list(self.active_procs.values())
+        for p in procs:
+            try:
+                p.kill()
+            except OSError:
+                pass
+        if procs:
+            log.warning("cancel_all killed %d process(es)", len(procs))
+        return len(procs)
 
     # ---- transport checks ----------------------------------------------
     def vpn_up(self) -> bool:
@@ -86,7 +102,7 @@ class Runner:
     # ---- execution ------------------------------------------------------
     def run(self, tool: str, args: list[str], *, target_host: str | None = None,
             target_id: int | None = None, agent: str = "user",
-            timeout: int | None = None) -> RunResult:
+            timeout: int | None = None, cancel_event=None) -> RunResult:
         # 1. allowlist
         if tool not in self.allowed_tools:
             self.audit.log(agent, "runner", "tool_refused",
@@ -153,21 +169,42 @@ class Runner:
                         "proxychains": wrapped, "vpn_up": self.vpn_up(),
                         "opsec": opsec_notes})
 
-        # 5. execute
+        # 5. execute (Popen so the operator can kill a running process)
         timeout = timeout or self.default_timeout
         t0 = time.time()
         status, out = "ok", ""
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        with self._active_lock:
+            self.active_procs[proc.pid] = proc
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=timeout)
-            exit_code = proc.returncode
-            out = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr else "")
-        except subprocess.TimeoutExpired as tex:
-            log.warning("timeout after %ss: %s", timeout, tool)
-            exit_code = -9
-            status = "timeout"
-            out = (tex.stdout or "") if isinstance(tex.stdout, str) else ""
-            out += f"\n[TIMEOUT after {timeout}s]"
+            while True:
+                try:
+                    stdout, stderr = proc.communicate(timeout=1.0)
+                    exit_code = proc.returncode
+                    out = (stdout or "") + (("\n[stderr]\n" + stderr) if stderr else "")
+                    break
+                except subprocess.TimeoutExpired:
+                    if cancel_event is not None and cancel_event.is_set():
+                        proc.kill()
+                        proc.communicate()
+                        exit_code = -15
+                        status = "cancelled"
+                        out = "[CANCELLED by operator]"
+                        log.warning("process killed by operator: %s (pid %s)",
+                                    tool, proc.pid)
+                        break
+                    if time.time() - t0 > timeout:
+                        proc.kill()
+                        stdout, stderr = proc.communicate()
+                        log.warning("timeout after %ss: %s", timeout, tool)
+                        exit_code = -9
+                        status = "timeout"
+                        out = (stdout or "") + f"\n[TIMEOUT after {timeout}s]"
+                        break
+        finally:
+            with self._active_lock:
+                self.active_procs.pop(proc.pid, None)
         duration = time.time() - t0
         if status == "ok" and exit_code != 0:
             status = "error"

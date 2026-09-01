@@ -51,6 +51,10 @@ Commands:
   /findings [host]            show recorded findings
   /attempts <host>            show attack attempt memory
   /loot [host]                show the loot vault (creds, hashes, files)
+  /loot show <id>             view full loot content (decrypted)
+  /authorize <host> [label]   add host/CIDR to authorization.json scope
+  /missions                   list running/finished missions
+  /stop <id|all>              stop a running mission / kill all processes
   /hashes <outfile>           export captured hashes for john/hashcat
   /map [host]                 MITRE ATT&CK coverage heatmap
   /webvuln <host>             web pipeline: discover HTTP + nuclei scan
@@ -264,6 +268,10 @@ class Shell:
         return self._target_or_print(host)
 
     def cmd_loot(self, args):
+        if args and args[0] == "show":
+            if len(args) > 1 and args[1].isdigit():
+                return self.cmd_loot_show(int(args[1]))
+            return self.console.print("[red]usage: /loot show <id>[/]")
         row = self.db.get_target(args[0]) if args else None
         items = self.db.loot_for(row["id"]) if row else self.db.loot_for()
         table = Table(title="Loot vault")
@@ -419,19 +427,31 @@ class Shell:
             return
         self.dashboard = DashboardServer(self.db, port=port)
         self.dashboard.mission_handler = self._mission_handler
+        self.dashboard.scope_handler = self._scope_handler
         url = self.dashboard.start()
         self.audit.log("operator", "dashboard", "start", {"url": url})
         self.console.print(f"[green]War Room live at {url}[/] (auto-refreshes; "
                            f"mission control enabled)")
 
-    def _mission_handler(self, host: str, mode: str) -> None:
+    def _scope_handler(self, host: str, network: str = "") -> None:
+        """War Room 'Add to Scope' — edits authorization.json, audited."""
+        host = host.strip()
+        if not host:
+            raise ValueError("empty host")
+        self.scope.add_to_scope(host)
+        desc = f"network: {network}" if network else "added via War Room"
+        self.db.add_target(host, desc)
+        self.audit.log("war-room", "scope", "add",
+                       {"host": host, "network": network})
+
+    def _mission_handler(self, host: str, mode: str, cancel_event=None) -> None:
         """War Room mission launch (HTTP API entry). Scope is enforced here."""
         self.scope.check(host)  # raises → mission status = error
         self.audit.log("war-room", "mission", "start", {"host": host, "mode": mode})
         if mode == "mission":
-            self.coordinator.run_mission(host)
+            self.coordinator.run_mission(host, cancel_event=cancel_event)
         else:
-            self.agent.run(mode, host)
+            self.agent.run(mode, host, cancel_event=cancel_event)
 
     def cmd_mission(self, args):
         if not args:
@@ -533,6 +553,66 @@ class Shell:
                                    .get("logs_dir", "logs"), lines):
             self.console.print(f"[dim]{line}[/]")
 
+    # ---- v0.5 handlers: scope-add, kill switch, loot viewing ---------------
+    def cmd_authorize(self, args):
+        if not args:
+            return self.console.print("[red]usage: /authorize <host|CIDR> "
+                                      "[network-label][/]")
+        host, network = args[0], " ".join(args[1:])
+        try:
+            self._scope_handler(host, network)
+            self.console.print(f"[green]Authorized & registered:[/] {host}"
+                               + (f" (network: {network})" if network else ""))
+        except Exception as exc:
+            self.console.print(f"[red]{exc}[/]")
+
+    def cmd_loot_show(self, loot_id: int):
+        row = self.db.conn.execute("SELECT * FROM loot WHERE id = ?",
+                                   (loot_id,)).fetchone()
+        if not row:
+            return self.console.print(f"[red]no loot #{loot_id}[/]")
+        item = self.db._decrypt_row(row)
+        self.console.print(f"[bold]#{item['id']} ({item['kind']}) "
+                           f"{item['title']}[/]")
+        if item["value"]:
+            self.console.print(item["value"])
+        if item["file_path"]:
+            self.console.print(f"file: {item['file_path']}")
+        if item["source"]:
+            self.console.print(f"[dim]source: {item['source']}[/]")
+        self.audit.log("operator", "loot", "view", {"id": loot_id})
+
+    def cmd_missions(self):
+        if not self.dashboard or not self.dashboard.missions:
+            return self.console.print("[yellow]No missions tracked — start the "
+                                      "War Room with /dashboard or use /scan.[/]")
+        table = Table(title="Missions")
+        for col in ("id", "mode", "host", "status"):
+            table.add_column(col)
+        for mid, m in self.dashboard.missions.items():
+            table.add_row(str(mid), m["mode"], m["host"], m["status"])
+        self.console.print(table)
+
+    def cmd_stop(self, args):
+        if not args:
+            return self.console.print("[red]usage: /stop <mission-id|all>[/]")
+        if args[0] == "all":
+            n = self.runner.cancel_all()
+            if self.dashboard:
+                for mid, m in self.dashboard.missions.items():
+                    if m["status"] == "running":
+                        self.dashboard.stop_mission(mid)
+            self.audit.log("operator", "mission", "stop_all", {"killed": n})
+            return self.console.print(f"[yellow]Stopped everything — "
+                                      f"{n} process(es) killed.[/]")
+        if not self.dashboard:
+            return self.console.print("[red]no War Room running[/]")
+        if self.dashboard.stop_mission(int(args[0])):
+            self.audit.log("operator", "mission", "stop", {"id": args[0]})
+            self.console.print(f"[yellow]Mission {args[0]} stopping…[/]")
+        else:
+            self.console.print(f"[red]mission {args[0]} not running[/]")
+
     # ---- main loop -------------------------------------------------------
     def run(self):
         self.console.print(BANNER, style="bold blue")
@@ -614,6 +694,12 @@ class Shell:
                     self.cmd_doctor()
                 elif cmd == "logs":
                     self.cmd_logs(args)
+                elif cmd == "authorize":
+                    self.cmd_authorize(args)
+                elif cmd == "missions":
+                    self.cmd_missions()
+                elif cmd == "stop":
+                    self.cmd_stop(args)
                 elif cmd == "mission":
                     self.cmd_mission(args)
                 elif cmd == "refute":

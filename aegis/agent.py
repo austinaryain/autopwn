@@ -147,8 +147,10 @@ class Agent:
                 pass
         return result.stdout_tail
 
-    def run(self, mode: str, target: str, *, on_step=None) -> dict:
-        """Run an agent loop. mode: 'scan' | 'attack'. on_step(dict) callback."""
+    def run(self, mode: str, target: str, *, on_step=None,
+            cancel_event=None) -> dict:
+        """Run an agent loop. mode: 'scan' | 'attack'. on_step(dict) callback.
+        cancel_event: threading.Event — set it to stop the agent cleanly."""
         target_row = self.db.get_target(target) or self.db.add_target(target) \
             and self.db.get_target(target)
         target_id = target_row["id"]
@@ -162,6 +164,14 @@ class Agent:
         repeats = 0
         steps, transcript = [], []
         for step in range(1, self.max_steps + 1):
+            # operator kill switch
+            if cancel_event is not None and cancel_event.is_set():
+                log.warning("agent on %s cancelled by operator at step %s",
+                            target, step)
+                transcript.append({"step": step, "done": True,
+                                   "summary": "cancelled by operator"})
+                self.db.set_target_status(target_id, "cancelled")
+                break
             # time budget circuit breaker
             if (_time.time() - started) / 60 > self.time_budget_min:
                 transcript.append({"step": step, "done": True,
@@ -217,7 +227,8 @@ class Agent:
 
             try:
                 result = self.runner.run(tool, args, target_host=target_row["host"],
-                                         target_id=target_id, agent=f"{mode}-agent")
+                                         target_id=target_id, agent=f"{mode}-agent",
+                                         cancel_event=cancel_event)
             except RunnerError as exc:
                 event["error"] = str(exc)
                 transcript.append(event)

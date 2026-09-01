@@ -67,7 +67,7 @@ class Coordinator:
         self.refuter = refuter
 
     def run_mission(self, target: str, *, skip_exploit: bool = False,
-                    on_step=None) -> dict:
+                    on_step=None, cancel_event=None) -> dict:
         result: dict = {"target": target, "phases": {}}
 
         def phase_cb(phase):
@@ -78,13 +78,19 @@ class Coordinator:
 
         # Phase 1 — recon
         result["phases"]["recon"] = self.agent.run(
-            "scan", target, on_step=phase_cb("recon"))
+            "scan", target, on_step=phase_cb("recon"), cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            self.db.set_target_status(self.db.get_target(target)["id"],
+                                      "cancelled")
+            result["phases"]["cancelled"] = True
+            return result
         self.agent.llm  # planner briefs are per-mode; recon uses scan brief
 
         # Phase 2 — exploitation (optional, confirmation handled by caller)
         if not skip_exploit:
             result["phases"]["exploiter"] = self.agent.run(
-                "attack", target, on_step=phase_cb("exploiter"))
+                "attack", target, on_step=phase_cb("exploiter"),
+                cancel_event=cancel_event)
 
         # Phase 3 — analyst: refute + narrative
         row = self.db.get_target(target)

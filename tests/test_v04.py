@@ -111,7 +111,7 @@ def test_mission_api(workspace):
     db = EngagementDB("eng.db")
     server = DashboardServer(db, port=8897)
     launched = []
-    server.mission_handler = lambda host, mode: launched.append((host, mode))
+    server.mission_handler = lambda host, mode, cancel: launched.append((host, mode))
     server.start()
     try:
         # unauthorized

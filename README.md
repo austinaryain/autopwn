@@ -87,6 +87,17 @@ Two logging layers, two different questions:
 
 First run on Kali: `bash setup_kali.sh` — checks/installs everything, pulls the Ollama model, walks you through scoping `authorization.json`, and gates on the full test suite + simulation validation before declaring readiness.
 
+## v0.5 — operator UX (TryHackMe field feedback)
+
+Driven by real lab usage — less typing, full control, loot at your fingertips:
+
+| Feature | Detail |
+|---|---|
+| **Scope from the War Room** | "Add to Scope" form on the dashboard (host + network label) → atomic, idempotent write to `authorization.json` + auto-registers the target + audit entry. CLI equivalent: `/authorize 10.10.10.5 tryhackme`. |
+| **Kill switch** | Every tool process and agent loop is cancellable: red **■ stop** button per running mission in the War Room, `POST /api/mission/stop`, `/stop <id>` or `/stop all` in the CLI. Cancellation kills the subprocess tree, marks the mission "stopped by operator", and is audit-logged. |
+| **Loot viewing** | `/loot show <id>` prints the full decrypted credential/note/file path. War Room loot rows have **reveal** links (`GET /api/loot?id=N&reveal=1`) — masked by default, decrypted on demand, every view audit-logged. |
+| **Mission visibility** | `/missions` lists all War Room missions (id, host, mode, status); running missions show live status in the dashboard. |
+
 ## v0.4 — trust & kill-chain maturity (T3MP3ST gap-closure)
 
 | Feature | Detail |
